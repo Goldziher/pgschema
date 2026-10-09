@@ -508,9 +508,9 @@ func detectPostgresMajorVersion(db *sql.DB) (int, error) {
 func validateSchemaFingerprint(migrationPlan *plan.Plan, host string, port int, db, user, password, sslmode, schema, applicationName string, ignoreConfig *ir.IgnoreConfig) error {
 	// Get current state from target database with ignore config
 	// This ensures ignored objects are excluded from fingerprint calculation
-	currentStateIR, err := util.GetIRFromDatabaseAsRole(
+	currentStateIR, err := util.GetIRFromDatabase(
 		host, port, db, user, password, sslmode, schema, applicationName,
-		ignoreConfig, "", migrationPlan.SourceInspectionRole,
+		ignoreConfig, "",
 	)
 	if err != nil {
 		return fmt.Errorf("failed to get current database state for fingerprint validation: %w", err)
@@ -557,10 +557,16 @@ func executeGroup(ctx context.Context, conn *sql.DB, group plan.ExecutionGroup, 
 // executeGroupConcatenated concatenates all SQL statements and executes them in an implicit transaction
 func executeGroupConcatenated(ctx context.Context, conn *sql.DB, group plan.ExecutionGroup, groupNum int, quiet bool, retry lockRetryConfig) error {
 	var sqlStatements []string
+	if group.ExecutionRole != "" {
+		sqlStatements = append(sqlStatements, "SET ROLE "+ir.QuoteIdentifier(group.ExecutionRole))
+	}
 
 	// Collect all SQL statements
 	for _, step := range group.Steps {
 		sqlStatements = append(sqlStatements, step.SQL)
+	}
+	if group.ExecutionRole != "" {
+		sqlStatements = append(sqlStatements, "RESET ROLE")
 	}
 
 	// Concatenate all SQL statements
@@ -593,6 +599,21 @@ func executeGroupConcatenated(ctx context.Context, conn *sql.DB, group plan.Exec
 
 // executeGroupIndividually executes statements individually without transactions
 func executeGroupIndividually(ctx context.Context, conn *sql.DB, group plan.ExecutionGroup, groupNum int, quiet bool) error {
+	if group.ExecutionRole != "" {
+		if _, err := util.ExecContextWithLogging(ctx, conn, "SET ROLE "+ir.QuoteIdentifier(group.ExecutionRole), "set group execution role"); err != nil {
+			return fmt.Errorf("failed to set execution role for group %d: %w", groupNum, err)
+		}
+	}
+	groupErr := executeGroupStepsIndividually(ctx, conn, group, groupNum, quiet)
+	if group.ExecutionRole != "" {
+		if _, err := util.ExecContextWithLogging(ctx, conn, "RESET ROLE", "reset group execution role"); err != nil && groupErr == nil {
+			return fmt.Errorf("failed to reset execution role for group %d: %w", groupNum, err)
+		}
+	}
+	return groupErr
+}
+
+func executeGroupStepsIndividually(ctx context.Context, conn *sql.DB, group plan.ExecutionGroup, groupNum int, quiet bool) error {
 	for stepIdx, step := range group.Steps {
 		if step.Directive != nil {
 			// Handle directive execution

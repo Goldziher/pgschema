@@ -27,21 +27,23 @@ type RoleState struct {
 }
 
 type MembershipState struct {
-	Role    string `json:"role"`
-	Member  string `json:"member"`
-	Admin   bool   `json:"admin"`
-	Inherit bool   `json:"inherit"`
-	Set     bool   `json:"set"`
+	Role     string   `json:"role"`
+	Member   string   `json:"member"`
+	Admin    bool     `json:"admin"`
+	Inherit  bool     `json:"inherit"`
+	Set      bool     `json:"set"`
+	Grantors []string `json:"grantors,omitempty"`
 }
 
 type Snapshot struct {
 	Roles             map[string]RoleState
-	Memberships       map[string]MembershipState
-	Ownership         map[string]OwnershipState
-	DefaultPrivileges map[string]DefaultPrivilegeState
+	Memberships       map[MembershipRef]MembershipState
+	Ownership         map[OwnershipRef]OwnershipState
+	DefaultPrivileges map[DefaultPrivilegeRef]DefaultPrivilegeState
 	SessionRole       RoleState
 	SessionAdminRoles map[string]bool
 	SessionSetRoles   map[string]bool
+	OwnerSetRoles     map[RoleTransition]bool
 }
 
 type OwnershipState struct {
@@ -49,6 +51,11 @@ type OwnershipState struct {
 	Name           string `json:"name"`
 	Owner          string `json:"owner"`
 	ExtensionOwned bool   `json:"extension_owned,omitempty"`
+}
+
+type RoleTransition struct {
+	From string `json:"from"`
+	To   string `json:"to"`
 }
 
 type DefaultPrivilegeState struct {
@@ -61,6 +68,11 @@ type DefaultPrivilegeState struct {
 type MembershipRef struct {
 	Role   string `json:"role"`
 	Member string `json:"member"`
+}
+
+type OwnershipRef struct {
+	Kind string `json:"kind"`
+	Name string `json:"name"`
 }
 
 type Selection struct {
@@ -116,11 +128,12 @@ func Inspect(ctx context.Context, db *sql.DB, selection Selection, majorVersion 
 	normalizeSelection(&selection)
 	snapshot := Snapshot{
 		Roles:             make(map[string]RoleState),
-		Memberships:       make(map[string]MembershipState),
-		Ownership:         make(map[string]OwnershipState),
-		DefaultPrivileges: make(map[string]DefaultPrivilegeState),
+		Memberships:       make(map[MembershipRef]MembershipState),
+		Ownership:         make(map[OwnershipRef]OwnershipState),
+		DefaultPrivileges: make(map[DefaultPrivilegeRef]DefaultPrivilegeState),
 		SessionAdminRoles: make(map[string]bool),
 		SessionSetRoles:   make(map[string]bool),
+		OwnerSetRoles:     make(map[RoleTransition]bool),
 	}
 	var sessionConfig pq.StringArray
 	if err := db.QueryRowContext(ctx, `
@@ -210,9 +223,9 @@ ORDER BY rolname`, pq.Array(selection.Roles))
 	}
 
 	if len(selection.Memberships) > 0 {
-		options := "bool_or(m.admin_option), true AS inherit_option, true AS set_option"
+		options := "bool_or(m.admin_option), true AS inherit_option, true AS set_option, ARRAY[pg_get_userbyid(min(m.grantor))]"
 		if majorVersion >= 16 {
-			options = "bool_or(m.admin_option), bool_or(m.inherit_option), bool_or(m.set_option)"
+			options = "bool_or(m.admin_option), bool_or(m.inherit_option), bool_or(m.set_option), array_agg(DISTINCT pg_get_userbyid(m.grantor) ORDER BY pg_get_userbyid(m.grantor))"
 		}
 		rows, err := db.QueryContext(ctx, fmt.Sprintf(`
 SELECT granted.rolname, member.rolname, %s
@@ -225,15 +238,17 @@ ORDER BY granted.rolname, member.rolname`, options))
 			return Snapshot{}, fmt.Errorf("inspect role memberships: %w", err)
 		}
 		defer rows.Close()
-		wanted := make(map[string]struct{}, len(selection.Memberships))
+		wanted := make(map[MembershipRef]struct{}, len(selection.Memberships))
 		for _, membership := range selection.Memberships {
 			wanted[MembershipKey(membership.Role, membership.Member)] = struct{}{}
 		}
 		for rows.Next() {
 			var membership MembershipState
-			if err := rows.Scan(&membership.Role, &membership.Member, &membership.Admin, &membership.Inherit, &membership.Set); err != nil {
+			var grantors pq.StringArray
+			if err := rows.Scan(&membership.Role, &membership.Member, &membership.Admin, &membership.Inherit, &membership.Set, &grantors); err != nil {
 				return Snapshot{}, fmt.Errorf("scan role membership: %w", err)
 			}
+			membership.Grantors = append([]string(nil), grantors...)
 			key := MembershipKey(membership.Role, membership.Member)
 			if _, ok := wanted[key]; ok {
 				snapshot.Memberships[key] = membership
@@ -250,6 +265,20 @@ ORDER BY granted.rolname, member.rolname`, options))
 		}
 		if exists {
 			snapshot.Ownership[ownershipKey(object.Kind, object.Name)] = state
+			transition := RoleTransition{From: state.Owner, To: object.Owner}
+			_, desiredOwnerExists := snapshot.Roles[object.Owner]
+			if desiredOwnerExists && !snapshot.SessionRole.Superuser && state.Owner != snapshot.SessionRole.Name {
+				if _, inspected := snapshot.OwnerSetRoles[transition]; inspected {
+					continue
+				}
+				var canSet bool
+				if err := db.QueryRowContext(ctx,
+					"SELECT pg_has_role($1, $2, $3)", transition.From, transition.To, setPrivilege,
+				).Scan(&canSet); err != nil {
+					return Snapshot{}, fmt.Errorf("inspect ownership SET authority from %q to %q: %w", transition.From, transition.To, err)
+				}
+				snapshot.OwnerSetRoles[transition] = canSet
+			}
 		}
 	}
 	if len(selection.DefaultPrivileges) > 0 {
@@ -290,6 +319,7 @@ func ComputeFingerprint(snapshot Snapshot, selection Selection) (*Fingerprint, e
 		Ownership         []*OwnershipState        `json:"ownership"`
 		DefaultPrivileges []*DefaultPrivilegeState `json:"default_privileges"`
 		Authority         authorityState           `json:"authority"`
+		OwnerTransitions  []ownerTransitionState   `json:"owner_transitions,omitempty"`
 	}
 	authority := authorityState{
 		Name: snapshot.SessionRole.Name, Superuser: snapshot.SessionRole.Superuser,
@@ -317,6 +347,15 @@ func ComputeFingerprint(snapshot Snapshot, selection Selection) (*Fingerprint, e
 	sort.Strings(authority.AdminRoles)
 	sort.Strings(authority.SetRoles)
 	state := fingerprintState{Authority: authority}
+	for transition, canSet := range snapshot.OwnerSetRoles {
+		if canSet {
+			state.OwnerTransitions = append(state.OwnerTransitions, ownerTransitionState{From: transition.From, To: transition.To})
+		}
+	}
+	sort.Slice(state.OwnerTransitions, func(i, j int) bool {
+		return encodePath(state.OwnerTransitions[i].From, state.OwnerTransitions[i].To) <
+			encodePath(state.OwnerTransitions[j].From, state.OwnerTransitions[j].To)
+	})
 	for _, object := range selection.Ownership {
 		if stateValue, exists := snapshot.Ownership[ownershipKey(object.Kind, object.Name)]; exists {
 			copy := stateValue
@@ -366,6 +405,11 @@ type authorityState struct {
 	SetRoles   []string `json:"set_roles,omitempty"`
 }
 
+type ownerTransitionState struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
 func normalizeSelection(selection *Selection) {
 	sort.Strings(selection.Roles)
 	sort.Slice(selection.Memberships, func(i, j int) bool {
@@ -375,23 +419,43 @@ func normalizeSelection(selection *Selection) {
 		return selection.Memberships[i].Role < selection.Memberships[j].Role
 	})
 	sort.Slice(selection.Ownership, func(i, j int) bool {
-		return ownershipKey(selection.Ownership[i].Kind, selection.Ownership[i].Name) < ownershipKey(selection.Ownership[j].Kind, selection.Ownership[j].Name)
+		return ownershipKey(selection.Ownership[i].Kind, selection.Ownership[i].Name).Path() < ownershipKey(selection.Ownership[j].Kind, selection.Ownership[j].Name).Path()
 	})
 	sort.Slice(selection.DefaultPrivileges, func(i, j int) bool {
-		return defaultPrivilegeKey(selection.DefaultPrivileges[i].Owner, selection.DefaultPrivileges[i].ObjectType, selection.DefaultPrivileges[i].Grantee) < defaultPrivilegeKey(selection.DefaultPrivileges[j].Owner, selection.DefaultPrivileges[j].ObjectType, selection.DefaultPrivileges[j].Grantee)
+		return defaultPrivilegeKey(selection.DefaultPrivileges[i].Owner, selection.DefaultPrivileges[i].ObjectType, selection.DefaultPrivileges[i].Grantee).Path() < defaultPrivilegeKey(selection.DefaultPrivileges[j].Owner, selection.DefaultPrivileges[j].ObjectType, selection.DefaultPrivileges[j].Grantee).Path()
 	})
 }
 
-func MembershipKey(role, member string) string {
-	return role + "/" + member
+func MembershipKey(role, member string) MembershipRef {
+	return MembershipRef{Role: role, Member: member}
 }
 
-func ownershipKey(kind, name string) string {
-	return kind + "/" + name
+func ownershipKey(kind, name string) OwnershipRef {
+	return OwnershipRef{Kind: kind, Name: name}
 }
 
-func defaultPrivilegeKey(owner, objectType, grantee string) string {
-	return owner + "/" + objectType + "/" + grantee
+func defaultPrivilegeKey(owner, objectType, grantee string) DefaultPrivilegeRef {
+	return DefaultPrivilegeRef{Owner: owner, ObjectType: objectType, Grantee: grantee}
+}
+
+func encodePath(parts ...string) string {
+	var path strings.Builder
+	for _, part := range parts {
+		fmt.Fprintf(&path, "%d:%s", len(part), part)
+	}
+	return path.String()
+}
+
+func (ref MembershipRef) Path() string {
+	return encodePath(ref.Role, ref.Member)
+}
+
+func (ref OwnershipRef) Path() string {
+	return encodePath(ref.Kind, ref.Name)
+}
+
+func (ref DefaultPrivilegeRef) Path() string {
+	return encodePath(ref.Owner, ref.ObjectType, ref.Grantee)
 }
 
 func parseRoleConfiguration(entries []string) map[string]string {
@@ -419,7 +483,7 @@ func inspectOwnership(ctx context.Context, db *sql.DB, object Ownership) (Owners
 		return OwnershipState{}, false, nil
 	}
 	if err != nil {
-		return OwnershipState{}, false, fmt.Errorf("inspect ownership %s: %w", ownershipKey(object.Kind, object.Name), err)
+		return OwnershipState{}, false, fmt.Errorf("inspect ownership %s: %w", ownershipKey(object.Kind, object.Name).Path(), err)
 	}
 	return state, true, nil
 }
@@ -462,7 +526,7 @@ func splitQualifiedName(name string) (string, string, error) {
 	return schema, object, nil
 }
 
-func inspectDefaultPrivileges(ctx context.Context, db *sql.DB, refs []DefaultPrivilegeRef, destination map[string]DefaultPrivilegeState) error {
+func inspectDefaultPrivileges(ctx context.Context, db *sql.DB, refs []DefaultPrivilegeRef, destination map[DefaultPrivilegeRef]DefaultPrivilegeState) error {
 	for _, ref := range refs {
 		code := map[string]string{"tables": "r", "sequences": "S", "functions": "f", "types": "T", "schemas": "n"}[ref.ObjectType]
 		rows, err := db.QueryContext(ctx, `
@@ -475,7 +539,7 @@ WHERE owner_role.rolname = $1
   AND CASE WHEN x.grantee = 0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END = $3
 ORDER BY x.privilege_type`, ref.Owner, code, ref.Grantee)
 		if err != nil {
-			return fmt.Errorf("inspect global default privilege %s: %w", defaultPrivilegeKey(ref.Owner, ref.ObjectType, ref.Grantee), err)
+			return fmt.Errorf("inspect global default privilege %s: %w", defaultPrivilegeKey(ref.Owner, ref.ObjectType, ref.Grantee).Path(), err)
 		}
 		state := DefaultPrivilegeState{Owner: ref.Owner, ObjectType: ref.ObjectType, Grantee: ref.Grantee, Privileges: make(map[string]bool)}
 		for rows.Next() {

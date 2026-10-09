@@ -198,8 +198,8 @@ func LoadManifest(path string) (Manifest, error) {
 		return manifest.Ownership[i].Kind < manifest.Ownership[j].Kind
 	})
 	sort.Slice(manifest.DefaultPrivileges, func(i, j int) bool {
-		return defaultPrivilegeKey(manifest.DefaultPrivileges[i].Owner, manifest.DefaultPrivileges[i].ObjectType, manifest.DefaultPrivileges[i].Grantee) <
-			defaultPrivilegeKey(manifest.DefaultPrivileges[j].Owner, manifest.DefaultPrivileges[j].ObjectType, manifest.DefaultPrivileges[j].Grantee)
+		return defaultPrivilegeKey(manifest.DefaultPrivileges[i].Owner, manifest.DefaultPrivileges[i].ObjectType, manifest.DefaultPrivileges[i].Grantee).Path() <
+			defaultPrivilegeKey(manifest.DefaultPrivileges[j].Owner, manifest.DefaultPrivileges[j].ObjectType, manifest.DefaultPrivileges[j].Grantee).Path()
 	})
 	return manifest, nil
 }
@@ -212,7 +212,7 @@ func valueOr[T any](value *T, fallback T) T {
 }
 
 func validateManifest(manifest Manifest) error {
-	roles := make(map[string]struct{}, len(manifest.Roles))
+	roles := make(map[string]State, len(manifest.Roles))
 	for _, role := range manifest.Roles {
 		if role.Name == "" {
 			return fmt.Errorf("global role name must not be empty")
@@ -223,7 +223,7 @@ func validateManifest(manifest Manifest) error {
 		if _, exists := roles[role.Name]; exists {
 			return fmt.Errorf("global role %q is declared more than once", role.Name)
 		}
-		roles[role.Name] = struct{}{}
+		roles[role.Name] = role.State
 		if role.ConnectionLimit < -1 {
 			return fmt.Errorf("role %q has invalid connection_limit %d", role.Name, role.ConnectionLimit)
 		}
@@ -239,21 +239,27 @@ func validateManifest(manifest Manifest) error {
 		}
 	}
 
-	memberships := make(map[string]struct{}, len(manifest.Memberships))
+	memberships := make(map[MembershipRef]struct{}, len(manifest.Memberships))
 	for _, membership := range manifest.Memberships {
 		if membership.Role == "" || membership.Member == "" {
 			return fmt.Errorf("membership role and member must not be empty")
 		}
 		if membership.State != StatePresent && membership.State != StateAbsent {
-			return fmt.Errorf("membership %q has unsupported state %q: expected present or absent", MembershipKey(membership.Role, membership.Member), membership.State)
+			return fmt.Errorf("membership %q has unsupported state %q: expected present or absent", MembershipKey(membership.Role, membership.Member).Path(), membership.State)
 		}
 		key := MembershipKey(membership.Role, membership.Member)
 		if _, exists := memberships[key]; exists {
-			return fmt.Errorf("membership %q is declared more than once", key)
+			return fmt.Errorf("membership %q is declared more than once", key.Path())
 		}
 		memberships[key] = struct{}{}
+		if roles[membership.Role] == StateAbsent {
+			return fmt.Errorf("membership role %q is declared absent", membership.Role)
+		}
+		if roles[membership.Member] == StateAbsent {
+			return fmt.Errorf("membership member role %q is declared absent", membership.Member)
+		}
 	}
-	ownership := make(map[string]struct{}, len(manifest.Ownership))
+	ownership := make(map[OwnershipRef]struct{}, len(manifest.Ownership))
 	for _, object := range manifest.Ownership {
 		if !supportedOwnershipKinds[object.Kind] {
 			return fmt.Errorf("ownership %q has unsupported kind %q", object.Name, object.Kind)
@@ -263,11 +269,14 @@ func validateManifest(manifest Manifest) error {
 		}
 		key := ownershipKey(object.Kind, object.Name)
 		if _, exists := ownership[key]; exists {
-			return fmt.Errorf("ownership %q is declared more than once", key)
+			return fmt.Errorf("ownership %q is declared more than once", key.Path())
 		}
 		ownership[key] = struct{}{}
+		if roles[object.Owner] == StateAbsent {
+			return fmt.Errorf("ownership role %q is declared absent", object.Owner)
+		}
 	}
-	defaults := make(map[string]struct{}, len(manifest.DefaultPrivileges))
+	defaults := make(map[DefaultPrivilegeRef]struct{}, len(manifest.DefaultPrivileges))
 	for _, privilege := range manifest.DefaultPrivileges {
 		if !supportedDefaultPrivilegeTypes[privilege.ObjectType] {
 			return fmt.Errorf("default privilege has unsupported object_type %q", privilege.ObjectType)
@@ -281,16 +290,27 @@ func validateManifest(manifest Manifest) error {
 		if privilege.State == StatePresent && len(privilege.Privileges) == 0 {
 			return fmt.Errorf("present default privilege %q must declare at least one privilege", privilege.ObjectType)
 		}
+		seenPrivileges := make(map[string]struct{}, len(privilege.Privileges))
 		for _, name := range privilege.Privileges {
 			if !allowedDefaultPrivileges[privilege.ObjectType][name] {
 				return fmt.Errorf("default privilege %q is invalid for %s", name, privilege.ObjectType)
 			}
+			if _, exists := seenPrivileges[name]; exists {
+				return fmt.Errorf("duplicate privilege %q for %s", name, privilege.ObjectType)
+			}
+			seenPrivileges[name] = struct{}{}
 		}
 		key := defaultPrivilegeKey(privilege.Owner, privilege.ObjectType, privilege.Grantee)
 		if _, exists := defaults[key]; exists {
-			return fmt.Errorf("default privilege %q is declared more than once", key)
+			return fmt.Errorf("default privilege %q is declared more than once", key.Path())
 		}
 		defaults[key] = struct{}{}
+		if roles[privilege.Owner] == StateAbsent {
+			return fmt.Errorf("default privilege owner role %q is declared absent", privilege.Owner)
+		}
+		if privilege.Grantee != "PUBLIC" && roles[privilege.Grantee] == StateAbsent {
+			return fmt.Errorf("default privilege grantee role %q is declared absent", privilege.Grantee)
+		}
 	}
 	return nil
 }

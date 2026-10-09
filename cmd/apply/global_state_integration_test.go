@@ -112,7 +112,7 @@ privileges = ["USAGE"]
 	before, err := globalstate.Inspect(ctx, conn, selection, majorVersion)
 	require.NoError(t, err)
 	require.Equal(t, map[string]bool{"USAGE": false},
-		before.DefaultPrivileges["app_login/types/PUBLIC"].Privileges,
+		before.DefaultPrivileges[globalstate.DefaultPrivilegeRef{Owner: "app_login", ObjectType: "types", Grantee: "PUBLIC"}].Privileges,
 		"a present role without a pg_default_acl row must expose PostgreSQL's implicit PUBLIC baseline")
 
 	config := &planCmd.PlanConfig{
@@ -126,8 +126,8 @@ privileges = ["USAGE"]
 	require.NoError(t, err)
 	require.Equal(t, before, afterPlan, "planning must not mutate target cluster-global state")
 	require.Equal(t, []string{
-		"CREATE ROLE app_group WITH NOSUPERUSER NOLOGIN INHERIT NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1 VALID UNTIL 'infinity'",
-		"ALTER ROLE app_login WITH NOSUPERUSER LOGIN INHERIT NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 12 VALID UNTIL '2030-01-02T03:04:05Z'; ALTER ROLE app_login RESET ALL; ALTER ROLE app_login SET statement_timeout TO '5s'",
+		"CREATE ROLE app_group WITH NOSUPERUSER NOLOGIN INHERIT NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1 VALID UNTIL E'infinity'",
+		"ALTER ROLE app_login WITH NOSUPERUSER LOGIN INHERIT NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 12 VALID UNTIL E'2030-01-02T03:04:05Z'; ALTER ROLE app_login RESET ALL; ALTER ROLE app_login SET statement_timeout TO E'5s'",
 	}, []string{migrationPlan.Groups[0].Steps[0].SQL, migrationPlan.Groups[0].Steps[1].SQL})
 	require.NotNil(t, migrationPlan.SourceGlobalFingerprint)
 	require.Contains(t, migrationPlan.HumanColored(false), "Roles:")
@@ -303,11 +303,12 @@ state = "absent"
 	require.NoError(t, err)
 	require.Equal(t, before, afterPlan, "authority planning must not mutate target global state")
 
-	require.NoError(t, ApplyMigration(&ApplyConfig{
+	applyErr := ApplyMigration(&ApplyConfig{
 		Host: host, Port: port, DB: database, User: "deployer", Password: "deployer-pass",
 		Schema: "public", Plan: migrationPlan, AutoApprove: true, Quiet: true,
 		ApplicationName: "pgschema-global-state-authority-test", SSLMode: "disable",
-	}, nil))
+	}, nil)
+	require.NoError(t, applyErr, migrationPlan.ToSQL(plan.SQLFormatRaw))
 	var owner string
 	require.NoError(t, deployer.QueryRowContext(ctx,
 		"SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'public.documents'::regclass").Scan(&owner))

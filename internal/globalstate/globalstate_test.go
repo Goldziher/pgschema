@@ -62,29 +62,32 @@ func TestPlanChangesCreatesAndAltersRolesBeforeMemberships(t *testing.T) {
 			"app_login":      {Name: "app_login", Inherit: true, ConnectionLimit: -1},
 			"provider_admin": {Name: "provider_admin", Inherit: true, ConnectionLimit: -1},
 		},
-		Memberships: map[string]MembershipState{},
+		Memberships: map[MembershipRef]MembershipState{},
 	}
 
 	changes, err := PlanChanges(manifest, current, 16)
 	require.NoError(t, err)
 	require.Equal(t, []Change{
 		{
-			SQL:       `CREATE ROLE app_group WITH NOSUPERUSER NOLOGIN INHERIT NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1 VALID UNTIL 'infinity'`,
+			SQL:       `CREATE ROLE app_group WITH NOSUPERUSER NOLOGIN INHERIT NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1 VALID UNTIL E'infinity'`,
 			Type:      "role",
 			Operation: "create",
 			Path:      "app_group",
+			RoleName:  "app_group",
 		},
 		{
-			SQL:       `ALTER ROLE app_login WITH NOSUPERUSER LOGIN INHERIT NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 12 VALID UNTIL 'infinity'; ALTER ROLE app_login RESET ALL`,
+			SQL:       `ALTER ROLE app_login WITH NOSUPERUSER LOGIN INHERIT NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 12 VALID UNTIL E'infinity'; ALTER ROLE app_login RESET ALL`,
 			Type:      "role",
 			Operation: "alter",
 			Path:      "app_login",
+			RoleName:  "app_login",
 		},
 		{
-			SQL:       `GRANT app_group TO app_login WITH ADMIN FALSE, INHERIT FALSE, SET TRUE`,
-			Type:      "role_membership",
-			Operation: "create",
-			Path:      "app_group/app_login",
+			SQL:        `GRANT app_group TO app_login WITH ADMIN FALSE, INHERIT FALSE, SET TRUE`,
+			Type:       "role_membership",
+			Operation:  "create",
+			Path:       MembershipKey("app_group", "app_login").Path(),
+			Membership: &MembershipRef{Role: "app_group", Member: "app_login"},
 		},
 	}, changes)
 }
@@ -109,7 +112,7 @@ func TestPlanChangesPostgres15MembershipOptions(t *testing.T) {
 	require.ErrorContains(t, err, "PostgreSQL 16 or newer")
 
 	manifest.Memberships[0].Inherit = true
-	current.Memberships = map[string]MembershipState{
+	current.Memberships = map[MembershipRef]MembershipState{
 		MembershipKey("app_group", "app_login"): {Role: "app_group", Member: "app_login", Admin: true, Inherit: true, Set: true},
 	}
 	changes, err := PlanChanges(manifest, current, 15)
@@ -189,8 +192,8 @@ func TestFingerprintIncludesOnlyRelevantApplyingAuthority(t *testing.T) {
 		SessionAdminRoles: map[string]bool{"app_owner": true},
 		SessionSetRoles:   map[string]bool{"app_owner": true},
 		Roles:             map[string]RoleState{"app_owner": {Name: "app_owner"}},
-		Ownership: map[string]OwnershipState{
-			"table/public.documents": {Kind: "table", Name: "public.documents", Owner: "existing_owner"},
+		Ownership: map[OwnershipRef]OwnershipState{
+			ownershipKey("table", "public.documents"): {Kind: "table", Name: "public.documents", Owner: "existing_owner"},
 		},
 	}
 	withUnrelatedAuthority := base
@@ -231,15 +234,15 @@ func TestPlanChangesConvergesRoleLifecycleOwnershipAndGlobalDefaults(t *testing.
 			"app_reader":   {Name: "app_reader"},
 			"retired_role": {Name: "retired_role"},
 		},
-		Ownership: map[string]OwnershipState{
-			"table/public.documents": {Kind: "table", Name: "public.documents", Owner: "postgres"},
+		Ownership: map[OwnershipRef]OwnershipState{
+			ownershipKey("table", "public.documents"): {Kind: "table", Name: "public.documents", Owner: "postgres"},
 		},
-		DefaultPrivileges: map[string]DefaultPrivilegeState{},
+		DefaultPrivileges: map[DefaultPrivilegeRef]DefaultPrivilegeState{},
 	}
 
 	changes, err := PlanChanges(manifest, current, 18)
 	require.NoError(t, err)
-	require.Equal(t, `ALTER ROLE app_owner WITH NOSUPERUSER NOLOGIN INHERIT NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1 VALID UNTIL '2030-01-02T03:04:05Z'; ALTER ROLE app_owner RESET ALL; ALTER ROLE app_owner SET statement_timeout TO '5s'`, changes[0].SQL)
+	require.Equal(t, `ALTER ROLE app_owner WITH NOSUPERUSER NOLOGIN INHERIT NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1 VALID UNTIL E'2030-01-02T03:04:05Z'; ALTER ROLE app_owner RESET ALL; ALTER ROLE app_owner SET statement_timeout TO E'5s'`, changes[0].SQL)
 	require.Equal(t, "post", changes[1].Phase)
 	require.Equal(t, `DROP ROLE retired_role`, changes[1].SQL)
 	require.Equal(t, `ALTER TABLE public.documents OWNER TO app_owner`, changes[2].SQL)
@@ -265,8 +268,8 @@ func TestPlanChangesRevokesImplicitPublicFunctionExecute(t *testing.T) {
 	current := Snapshot{
 		SessionRole: RoleState{Name: "postgres", Superuser: true},
 		Roles:       map[string]RoleState{"app_owner": {Name: "app_owner"}},
-		DefaultPrivileges: map[string]DefaultPrivilegeState{
-			"app_owner/functions/PUBLIC": {
+		DefaultPrivileges: map[DefaultPrivilegeRef]DefaultPrivilegeState{
+			defaultPrivilegeKey("app_owner", "functions", "PUBLIC"): {
 				Owner: "app_owner", ObjectType: "functions", Grantee: "PUBLIC",
 				Privileges: map[string]bool{"EXECUTE": false},
 			},
@@ -288,8 +291,8 @@ func TestPlanChangesRejectsUnprovenOwnershipAuthorityAndExtensionMembers(t *test
 	current := Snapshot{
 		SessionRole: RoleState{Name: "deployer", CreateRole: true},
 		Roles:       map[string]RoleState{"app_owner": {Name: "app_owner"}},
-		Ownership: map[string]OwnershipState{
-			"table/public.documents": {Kind: "table", Name: "public.documents", Owner: "existing_owner"},
+		Ownership: map[OwnershipRef]OwnershipState{
+			ownershipKey("table", "public.documents"): {Kind: "table", Name: "public.documents", Owner: "existing_owner"},
 		},
 	}
 
@@ -297,7 +300,7 @@ func TestPlanChangesRejectsUnprovenOwnershipAuthorityAndExtensionMembers(t *test
 	require.ErrorContains(t, err, "cannot assume current owner role")
 
 	current.SessionRole.Superuser = true
-	current.Ownership["table/public.documents"] = OwnershipState{
+	current.Ownership[ownershipKey("table", "public.documents")] = OwnershipState{
 		Kind: "table", Name: "public.documents", Owner: "existing_owner", ExtensionOwned: true,
 	}
 	_, err = PlanChanges(manifest, current, 18)
@@ -321,9 +324,9 @@ func TestPlanChangesRequiresDeclaredSetMembershipForNewOwner(t *testing.T) {
 		SessionAdminRoles: map[string]bool{},
 		SessionSetRoles:   map[string]bool{},
 		Roles:             map[string]RoleState{"deployer": {Name: "deployer"}},
-		Ownership:         map[string]OwnershipState{},
-		DefaultPrivileges: map[string]DefaultPrivilegeState{
-			"app_owner/functions/PUBLIC": {
+		Ownership:         map[OwnershipRef]OwnershipState{},
+		DefaultPrivileges: map[DefaultPrivilegeRef]DefaultPrivilegeState{
+			defaultPrivilegeKey("app_owner", "functions", "PUBLIC"): {
 				Owner: "app_owner", ObjectType: "functions", Grantee: "PUBLIC",
 				Privileges: map[string]bool{"EXECUTE": false},
 			},

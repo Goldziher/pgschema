@@ -12,11 +12,15 @@ import (
 )
 
 type Change struct {
-	SQL       string
-	Type      string
-	Operation string
-	Path      string
-	Phase     string
+	SQL              string
+	Type             string
+	Operation        string
+	Path             string
+	Phase            string
+	RoleName         string
+	Membership       *MembershipRef
+	Ownership        *Ownership
+	DefaultPrivilege *DefaultPrivilege
 }
 
 func PlanChanges(manifest Manifest, current Snapshot, majorVersion int) ([]Change, error) {
@@ -39,6 +43,8 @@ func PlanChanges(manifest Manifest, current Snapshot, majorVersion int) ([]Chang
 	})
 
 	var changes []Change
+	var finalMembershipChanges []Change
+	var finalRoleChanges []Change
 	available := make(map[string]bool, len(current.Roles)+len(roles))
 	createdRoles := make(map[string]bool)
 	for name := range current.Roles {
@@ -55,7 +61,7 @@ func PlanChanges(manifest Manifest, current Snapshot, majorVersion int) ([]Chang
 			}
 			changes = append(changes, Change{
 				SQL: "DROP ROLE " + ir.QuoteIdentifier(role.Name), Type: "role", Operation: "drop",
-				Path: role.Name, Phase: "post",
+				Path: role.Name, Phase: "post", RoleName: role.Name,
 			})
 			continue
 		}
@@ -75,16 +81,24 @@ func PlanChanges(manifest Manifest, current Snapshot, majorVersion int) ([]Chang
 				Type:      "role",
 				Operation: operation,
 				Path:      role.Name,
+				RoleName:  role.Name,
 			})
 			continue
 		}
 		if roleDiffers(role, actual) {
-			changes = append(changes, Change{
+			change := Change{
 				SQL:       roleChangeSQL("ALTER ROLE", role, true),
 				Type:      "role",
 				Operation: operation,
 				Path:      role.Name,
-			})
+				RoleName:  role.Name,
+			}
+			if role.Name == current.SessionRole.Name && roleReducesAuthority(role, actual) {
+				change.Phase = "final"
+				finalRoleChanges = append(finalRoleChanges, change)
+			} else {
+				changes = append(changes, change)
+			}
 		}
 	}
 
@@ -100,6 +114,27 @@ func PlanChanges(manifest Manifest, current Snapshot, majorVersion int) ([]Chang
 		}
 		key := MembershipKey(membership.Role, membership.Member)
 		actual, exists := current.Memberships[key]
+		if membership.State == StateAbsent {
+			if exists {
+				change := Change{
+					SQL:        fmt.Sprintf("REVOKE %s FROM %s", ir.QuoteIdentifier(membership.Role), ir.QuoteIdentifier(membership.Member)),
+					Type:       "role_membership",
+					Operation:  "drop",
+					Path:       key.Path(),
+					Membership: membershipRef(membership),
+				}
+				if majorVersion >= 16 && len(actual.Grantors) > 1 {
+					return nil, fmt.Errorf("membership %q has multiple grantors and cannot be safely revoked", key.Path())
+				}
+				if membership.Member == current.SessionRole.Name {
+					change.Phase = "final"
+					finalMembershipChanges = append(finalMembershipChanges, change)
+				} else {
+					changes = append(changes, change)
+				}
+			}
+			continue
+		}
 		omitAdmin := membership.Member == current.SessionRole.Name && membership.Admin &&
 			(current.SessionAdminRoles[membership.Role] ||
 				(majorVersion >= 16 && createdRoles[membership.Role] && !current.SessionRole.Superuser))
@@ -108,59 +143,68 @@ func PlanChanges(manifest Manifest, current Snapshot, majorVersion int) ([]Chang
 				(majorVersion >= 16 && createdRoles[membership.Role] && !current.SessionRole.Superuser)) {
 			return nil, fmt.Errorf("cannot converge ADMIN false for session role %q on role %q because PostgreSQL owns the creator ADMIN grant", membership.Member, membership.Role)
 		}
-		if membership.State == StateAbsent {
-			if exists {
-				changes = append(changes, Change{
-					SQL:       fmt.Sprintf("REVOKE %s FROM %s", ir.QuoteIdentifier(membership.Role), ir.QuoteIdentifier(membership.Member)),
-					Type:      "role_membership",
-					Operation: "drop",
-					Path:      key,
-				})
-			}
-			continue
-		}
 		if !exists {
 			changes = append(changes, Change{
-				SQL:       grantMembershipSQL(membership, majorVersion, omitAdmin),
-				Type:      "role_membership",
-				Operation: "create",
-				Path:      key,
+				SQL:        grantMembershipSQL(membership, majorVersion, omitAdmin),
+				Type:       "role_membership",
+				Operation:  "create",
+				Path:       key.Path(),
+				Membership: membershipRef(membership),
 			})
 			continue
 		}
 		if membership.Admin == actual.Admin && membership.Inherit == actual.Inherit && membership.Set == actual.Set {
 			continue
 		}
+		if majorVersion >= 16 && len(actual.Grantors) > 1 {
+			return nil, fmt.Errorf("membership %q has multiple grantors and cannot be safely altered", key.Path())
+		}
 		if majorVersion < 16 && actual.Admin && !membership.Admin {
-			changes = append(changes, Change{
-				SQL:       fmt.Sprintf("REVOKE ADMIN OPTION FOR %s FROM %s", ir.QuoteIdentifier(membership.Role), ir.QuoteIdentifier(membership.Member)),
-				Type:      "role_membership",
-				Operation: "alter",
-				Path:      key,
-			})
+			change := Change{
+				SQL:        fmt.Sprintf("REVOKE ADMIN OPTION FOR %s FROM %s", ir.QuoteIdentifier(membership.Role), ir.QuoteIdentifier(membership.Member)),
+				Type:       "role_membership",
+				Operation:  "alter",
+				Path:       key.Path(),
+				Membership: membershipRef(membership),
+			}
+			if membership.Member == current.SessionRole.Name {
+				change.Phase = "final"
+				finalMembershipChanges = append(finalMembershipChanges, change)
+			} else {
+				changes = append(changes, change)
+			}
 			continue
 		}
-		changes = append(changes, Change{
-			SQL:       grantMembershipSQL(membership, majorVersion, omitAdmin),
-			Type:      "role_membership",
-			Operation: "alter",
-			Path:      key,
-		})
+		change := Change{
+			SQL:        grantMembershipSQL(membership, majorVersion, omitAdmin),
+			Type:       "role_membership",
+			Operation:  "alter",
+			Path:       key.Path(),
+			Membership: membershipRef(membership),
+		}
+		if membership.Member == current.SessionRole.Name && membershipReducesAuthority(membership, actual, majorVersion) {
+			change.Phase = "final"
+			finalMembershipChanges = append(finalMembershipChanges, change)
+		} else {
+			changes = append(changes, change)
+		}
 	}
 	for _, object := range manifest.Ownership {
 		if !available[object.Owner] {
 			return nil, fmt.Errorf("ownership role %q is neither present nor declared", object.Owner)
 		}
-		actual, exists := current.Ownership[ownershipKey(object.Kind, object.Name)]
+		key := ownershipKey(object.Kind, object.Name)
+		actual, exists := current.Ownership[key]
 		if exists && actual.ExtensionOwned {
 			return nil, fmt.Errorf("refusing to manage ownership of extension member %s %q", object.Kind, object.Name)
 		}
 		if !exists || actual.Owner != object.Owner {
-			sql, err := ownershipSQL(object)
+			sql, err := ownershipSQL(object, actual, exists, current.SessionRole)
 			if err != nil {
 				return nil, err
 			}
-			changes = append(changes, Change{SQL: sql, Type: "ownership", Operation: "alter", Path: ownershipKey(object.Kind, object.Name), Phase: "post"})
+			objectCopy := object
+			changes = append(changes, Change{SQL: sql, Type: "ownership", Operation: "alter", Path: key.Path(), Phase: "post", Ownership: &objectCopy})
 		}
 	}
 	for _, privilege := range manifest.DefaultPrivileges {
@@ -173,7 +217,8 @@ func PlanChanges(manifest Manifest, current Snapshot, majorVersion int) ([]Chang
 		if !available[privilege.Owner] || (privilege.Grantee != "PUBLIC" && !available[privilege.Grantee]) {
 			return nil, fmt.Errorf("default privilege roles must be present or declared")
 		}
-		actual := current.DefaultPrivileges[defaultPrivilegeKey(privilege.Owner, privilege.ObjectType, privilege.Grantee)]
+		key := defaultPrivilegeKey(privilege.Owner, privilege.ObjectType, privilege.Grantee)
+		actual := current.DefaultPrivileges[key]
 		if defaultPrivilegeMatches(privilege, actual) {
 			continue
 		}
@@ -181,12 +226,15 @@ func PlanChanges(manifest Manifest, current Snapshot, majorVersion int) ([]Chang
 		if privilege.State == StateAbsent {
 			operation = "drop"
 		}
+		privilegeCopy := privilege
 		changes = append(changes, Change{
 			SQL:  defaultPrivilegeSQL(privilege, current.SessionRole.Name, !current.SessionRole.Superuser),
 			Type: "global_default_privilege", Operation: operation,
-			Path: defaultPrivilegeKey(privilege.Owner, privilege.ObjectType, privilege.Grantee), Phase: "post",
+			Path: key.Path(), Phase: "post", DefaultPrivilege: &privilegeCopy,
 		})
 	}
+	changes = append(changes, finalMembershipChanges...)
+	changes = append(changes, finalRoleChanges...)
 	if err := preflightRoleAuthority(manifest, current, changes, majorVersion); err != nil {
 		return nil, err
 	}
@@ -198,7 +246,7 @@ func preflightRoleAuthority(manifest Manifest, current Snapshot, changes []Chang
 		return nil
 	}
 	created := make(map[string]bool)
-	plannedSet := make(map[string]bool)
+	plannedSet := make(map[MembershipRef]bool)
 	for _, role := range manifest.Roles {
 		if role.State == StatePresent {
 			if _, exists := current.Roles[role.Name]; !exists {
@@ -207,9 +255,8 @@ func preflightRoleAuthority(manifest Manifest, current Snapshot, changes []Chang
 		}
 	}
 	for _, membership := range manifest.Memberships {
-		if membership.State == StatePresent && membership.Member == current.SessionRole.Name &&
-			(majorVersion < 16 || membership.Set) {
-			plannedSet[membership.Role] = true
+		if membership.State == StatePresent && (majorVersion < 16 || membership.Set) {
+			plannedSet[MembershipKey(membership.Role, membership.Member)] = true
 		}
 	}
 	for _, change := range changes {
@@ -221,9 +268,9 @@ func preflightRoleAuthority(manifest Manifest, current Snapshot, changes []Chang
 			if majorVersion < 16 {
 				continue
 			}
-			authorityRole := change.Path
+			authorityRole := change.RoleName
 			if change.Type == "role_membership" {
-				authorityRole, _, _ = strings.Cut(change.Path, "/")
+				authorityRole = change.Membership.Role
 			} else if change.Operation == "create" {
 				continue
 			}
@@ -231,20 +278,28 @@ func preflightRoleAuthority(manifest Manifest, current Snapshot, changes []Chang
 				return fmt.Errorf("session role %q lacks ADMIN OPTION on role %q required by the planned %s", current.SessionRole.Name, authorityRole, change.Type)
 			}
 		case "ownership":
-			object := ownershipForPath(manifest, change.Path)
-			actual, exists := current.Ownership[change.Path]
-			if exists && actual.Owner != current.SessionRole.Name && !current.SessionSetRoles[actual.Owner] {
+			object := *change.Ownership
+			actual, exists := current.Ownership[ownershipKey(object.Kind, object.Name)]
+			if exists && actual.Owner != current.SessionRole.Name && !current.SessionSetRoles[actual.Owner] &&
+				!plannedSet[MembershipKey(actual.Owner, current.SessionRole.Name)] {
 				return fmt.Errorf("session role %q cannot assume current owner role %q for %s", current.SessionRole.Name, actual.Owner, change.Path)
 			}
-			if object.Owner != current.SessionRole.Name && !current.SessionSetRoles[object.Owner] && !plannedSet[object.Owner] {
+			if exists && actual.Owner != object.Owner && actual.Owner != current.SessionRole.Name &&
+				!current.OwnerSetRoles[RoleTransition{From: actual.Owner, To: object.Owner}] &&
+				!plannedSet[MembershipKey(object.Owner, actual.Owner)] {
+				return fmt.Errorf("current owner role %q lacks SET authority on new owner role %q for %s", actual.Owner, object.Owner, change.Path)
+			}
+			if object.Owner != current.SessionRole.Name && !current.SessionSetRoles[object.Owner] &&
+				!plannedSet[MembershipKey(object.Owner, current.SessionRole.Name)] {
 				return fmt.Errorf("session role %q lacks SET authority on new owner role %q for %s; declare a SET-enabled membership", current.SessionRole.Name, object.Owner, change.Path)
 			}
 			if object.Kind == "database" && !current.SessionRole.CreateDB {
 				return fmt.Errorf("session role %q lacks CREATEDB required to change database ownership", current.SessionRole.Name)
 			}
 		case "global_default_privilege":
-			privilege := defaultPrivilegeForPath(manifest, change.Path)
-			if privilege.Owner != current.SessionRole.Name && !current.SessionSetRoles[privilege.Owner] && !plannedSet[privilege.Owner] {
+			privilege := *change.DefaultPrivilege
+			if privilege.Owner != current.SessionRole.Name && !current.SessionSetRoles[privilege.Owner] &&
+				!plannedSet[MembershipKey(privilege.Owner, current.SessionRole.Name)] {
 				return fmt.Errorf("session role %q lacks SET authority on default-privilege owner role %q; declare a SET-enabled membership", current.SessionRole.Name, privilege.Owner)
 			}
 		}
@@ -261,22 +316,20 @@ func preflightRoleAuthority(manifest Manifest, current Snapshot, changes []Chang
 	return nil
 }
 
-func ownershipForPath(manifest Manifest, path string) Ownership {
-	for _, object := range manifest.Ownership {
-		if ownershipKey(object.Kind, object.Name) == path {
-			return object
-		}
-	}
-	return Ownership{}
+func membershipRef(membership Membership) *MembershipRef {
+	return &MembershipRef{Role: membership.Role, Member: membership.Member}
 }
 
-func defaultPrivilegeForPath(manifest Manifest, path string) DefaultPrivilege {
-	for _, privilege := range manifest.DefaultPrivileges {
-		if defaultPrivilegeKey(privilege.Owner, privilege.ObjectType, privilege.Grantee) == path {
-			return privilege
-		}
+func membershipReducesAuthority(desired Membership, actual MembershipState, majorVersion int) bool {
+	if actual.Admin && !desired.Admin {
+		return true
 	}
-	return DefaultPrivilege{}
+	return majorVersion >= 16 && ((actual.Inherit && !desired.Inherit) || (actual.Set && !desired.Set))
+}
+
+func roleReducesAuthority(desired Role, actual RoleState) bool {
+	return (actual.CreateRole && !desired.CreateRole) || (actual.CreateDB && !desired.CreateDB) ||
+		(actual.Inherit && !desired.Inherit)
 }
 
 func roleDiffers(desired Role, actual RoleState) bool {
@@ -327,27 +380,35 @@ func validUntilMatches(desired, actual string) bool {
 }
 
 func quoteLiteral(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	return "E'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
-func ownershipSQL(object Ownership) (string, error) {
+func ownershipSQL(object Ownership, actual OwnershipState, exists bool, session RoleState) (string, error) {
 	owner := ir.QuoteIdentifier(object.Owner)
 	if object.Kind == "database" || object.Kind == "schema" {
-		return fmt.Sprintf("ALTER %s %s OWNER TO %s", strings.ToUpper(object.Kind), ir.QuoteIdentifier(object.Name), owner), nil
+		return ownershipAsCurrentOwner(fmt.Sprintf("ALTER %s %s OWNER TO %s", strings.ToUpper(object.Kind), ir.QuoteIdentifier(object.Name), owner), actual, exists, session), nil
 	}
 	if object.Kind == "function" || object.Kind == "procedure" {
 		routine, err := renderRoutineName(object.Name)
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("ALTER %s %s OWNER TO %s", strings.ToUpper(object.Kind), routine, owner), nil
+		return ownershipAsCurrentOwner(fmt.Sprintf("ALTER %s %s OWNER TO %s", strings.ToUpper(object.Kind), routine, owner), actual, exists, session), nil
 	}
 	schema, name, err := splitQualifiedName(object.Name)
 	if err != nil {
 		return "", err
 	}
 	kind := strings.ToUpper(strings.ReplaceAll(object.Kind, "_", " "))
-	return fmt.Sprintf("ALTER %s %s.%s OWNER TO %s", kind, ir.QuoteIdentifier(schema), ir.QuoteIdentifier(name), owner), nil
+	return ownershipAsCurrentOwner(fmt.Sprintf("ALTER %s %s.%s OWNER TO %s", kind, ir.QuoteIdentifier(schema), ir.QuoteIdentifier(name), owner), actual, exists, session), nil
+}
+
+func ownershipAsCurrentOwner(sql string, actual OwnershipState, exists bool, session RoleState) string {
+	if !exists || session.Superuser || actual.Owner == session.Name {
+		return sql
+	}
+	return "SET ROLE " + ir.QuoteIdentifier(actual.Owner) + "; " + sql + "; RESET ROLE"
 }
 
 func renderRoutineName(name string) (string, error) {

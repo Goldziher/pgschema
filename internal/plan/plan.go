@@ -46,7 +46,8 @@ type Step struct {
 
 // ExecutionGroup represents a group of steps that should be executed together
 type ExecutionGroup struct {
-	Steps []Step `json:"steps"`
+	Steps         []Step `json:"steps"`
+	ExecutionRole string `json:"execution_role,omitempty"`
 }
 
 // Plan represents the migration plan between two DDL states
@@ -61,7 +62,6 @@ type Plan struct {
 	// Source database fingerprint when plan was created
 	SourceFingerprint       *fingerprint.SchemaFingerprint `json:"source_fingerprint,omitempty"`
 	SourceGlobalFingerprint *globalstate.Fingerprint       `json:"source_global_fingerprint,omitempty"`
-	SourceInspectionRole    string                         `json:"source_inspection_role,omitempty"`
 
 	// Groups is the ordered list of execution groups
 	Groups []ExecutionGroup `json:"groups"`
@@ -167,6 +167,16 @@ func (p *Plan) AppendSteps(steps []Step) {
 		return
 	}
 	p.Groups = append(p.Groups, ExecutionGroup{Steps: steps})
+}
+
+// SetExecutionRole applies schema-local groups as an explicitly declared owner role.
+func (p *Plan) SetExecutionRole(role string) {
+	if role == "" {
+		return
+	}
+	for i := range p.Groups {
+		p.Groups[i].ExecutionRole = role
+	}
 }
 
 // ========== PUBLIC METHODS ==========

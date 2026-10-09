@@ -298,7 +298,6 @@ func GeneratePlan(config *PlanConfig, provider postgres.DesiredStateProvider) (*
 
 	var globalManifest *globalstate.Manifest
 	plannedRoles := make(map[string]bool)
-	inspectionRole := ""
 	if config.GlobalFile != "" {
 		manifest, err := globalstate.LoadManifest(config.GlobalFile)
 		if err != nil {
@@ -310,18 +309,12 @@ func GeneratePlan(config *PlanConfig, provider postgres.DesiredStateProvider) (*
 				plannedRoles[role.Name] = true
 			}
 		}
-		for _, object := range manifest.Ownership {
-			if object.Kind == "schema" && object.Name == config.Schema {
-				inspectionRole = object.Owner
-				break
-			}
-		}
 	}
 
 	// Get current state from target database
-	currentStateIR, err := util.GetIRFromDatabaseAsRole(
+	currentStateIR, err := util.GetIRFromDatabase(
 		config.Host, config.Port, config.DB, config.User, config.Password, config.SSLMode,
-		config.Schema, config.ApplicationName, ignoreConfig, "", inspectionRole,
+		config.Schema, config.ApplicationName, ignoreConfig, "",
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get current state from database: %w", err)
@@ -427,7 +420,6 @@ func GeneratePlan(config *PlanConfig, provider postgres.DesiredStateProvider) (*
 
 	// Create plan from diffs with fingerprint
 	migrationPlan := plan.NewPlanWithFingerprint(diffs, sourceFingerprint, targetMajorVersion, currentStateIR)
-	migrationPlan.SourceInspectionRole = inspectionRole
 
 	if globalManifest != nil {
 		selection := globalstate.SelectionFor(*globalManifest)
@@ -440,6 +432,11 @@ func GeneratePlan(config *PlanConfig, provider postgres.DesiredStateProvider) (*
 		if err != nil {
 			return nil, err
 		}
+		schemaOwnership := globalstate.OwnershipRef{Kind: "schema", Name: config.Schema}
+		if currentOwner, exists := currentGlobalState.Ownership[schemaOwnership]; exists &&
+			currentOwner.Owner != currentGlobalState.SessionRole.Name {
+			migrationPlan.SetExecutionRole(currentOwner.Owner)
+		}
 		globalFingerprint, err := globalstate.ComputeFingerprint(currentGlobalState, selection)
 		if err != nil {
 			return nil, err
@@ -450,9 +447,12 @@ func GeneratePlan(config *PlanConfig, provider postgres.DesiredStateProvider) (*
 		}
 		preSteps := make([]plan.Step, 0, len(globalChanges))
 		postChanges := make([]globalstate.Change, 0, len(globalChanges))
+		finalChanges := make([]globalstate.Change, 0, len(globalChanges))
 		globalDiffs := make([]diff.Diff, 0, len(globalChanges))
 		for _, change := range globalChanges {
-			if change.Phase == "post" {
+			if change.Phase == "final" {
+				finalChanges = append(finalChanges, change)
+			} else if change.Phase == "post" {
 				postChanges = append(postChanges, change)
 			} else {
 				preSteps = append(preSteps, plan.Step{SQL: change.SQL, Type: change.Type, Operation: change.Operation, Path: change.Path})
@@ -468,6 +468,11 @@ func GeneratePlan(config *PlanConfig, provider postgres.DesiredStateProvider) (*
 		migrationPlan.SourceDiffs = append(globalDiffs, migrationPlan.SourceDiffs...)
 		migrationPlan.PrependSteps(preSteps)
 		migrationPlan.AppendSteps(postSteps)
+		finalSteps := make([]plan.Step, 0, len(finalChanges))
+		for _, change := range finalChanges {
+			finalSteps = append(finalSteps, plan.Step{SQL: change.SQL, Type: change.Type, Operation: change.Operation, Path: change.Path})
+		}
+		migrationPlan.AppendSteps(finalSteps)
 	}
 
 	return migrationPlan, nil
@@ -500,10 +505,10 @@ func globalChangeDiff(change globalstate.Change) diff.Diff {
 func globalPostRank(change globalstate.Change) int {
 	switch change.Type {
 	case "ownership":
-		if strings.HasPrefix(change.Path, "schema/") {
+		if change.Ownership.Kind == "schema" {
 			return 0
 		}
-		if strings.HasPrefix(change.Path, "database/") {
+		if change.Ownership.Kind == "database" {
 			return 3
 		}
 		return 1
