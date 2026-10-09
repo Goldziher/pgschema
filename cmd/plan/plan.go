@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/pgplex/pgschema/cmd/util"
@@ -297,6 +298,7 @@ func GeneratePlan(config *PlanConfig, provider postgres.DesiredStateProvider) (*
 
 	var globalManifest *globalstate.Manifest
 	plannedRoles := make(map[string]bool)
+	inspectionRole := ""
 	if config.GlobalFile != "" {
 		manifest, err := globalstate.LoadManifest(config.GlobalFile)
 		if err != nil {
@@ -308,10 +310,19 @@ func GeneratePlan(config *PlanConfig, provider postgres.DesiredStateProvider) (*
 				plannedRoles[role.Name] = true
 			}
 		}
+		for _, object := range manifest.Ownership {
+			if object.Kind == "schema" && object.Name == config.Schema {
+				inspectionRole = object.Owner
+				break
+			}
+		}
 	}
 
 	// Get current state from target database
-	currentStateIR, err := util.GetIRFromDatabase(config.Host, config.Port, config.DB, config.User, config.Password, config.SSLMode, config.Schema, config.ApplicationName, ignoreConfig, "")
+	currentStateIR, err := util.GetIRFromDatabaseAsRole(
+		config.Host, config.Port, config.DB, config.User, config.Password, config.SSLMode,
+		config.Schema, config.ApplicationName, ignoreConfig, "", inspectionRole,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get current state from database: %w", err)
 	}
@@ -416,6 +427,7 @@ func GeneratePlan(config *PlanConfig, provider postgres.DesiredStateProvider) (*
 
 	// Create plan from diffs with fingerprint
 	migrationPlan := plan.NewPlanWithFingerprint(diffs, sourceFingerprint, targetMajorVersion, currentStateIR)
+	migrationPlan.SourceInspectionRole = inspectionRole
 
 	if globalManifest != nil {
 		selection := globalstate.SelectionFor(*globalManifest)
@@ -436,17 +448,26 @@ func GeneratePlan(config *PlanConfig, provider postgres.DesiredStateProvider) (*
 		if err != nil {
 			return nil, fmt.Errorf("failed to plan global state: %w", err)
 		}
-		steps := make([]plan.Step, 0, len(globalChanges))
+		preSteps := make([]plan.Step, 0, len(globalChanges))
+		postChanges := make([]globalstate.Change, 0, len(globalChanges))
 		globalDiffs := make([]diff.Diff, 0, len(globalChanges))
 		for _, change := range globalChanges {
-			steps = append(steps, plan.Step{
-				SQL: change.SQL, Type: change.Type, Operation: change.Operation, Path: change.Path,
-			})
+			if change.Phase == "post" {
+				postChanges = append(postChanges, change)
+			} else {
+				preSteps = append(preSteps, plan.Step{SQL: change.SQL, Type: change.Type, Operation: change.Operation, Path: change.Path})
+			}
 			globalDiffs = append(globalDiffs, globalChangeDiff(change))
+		}
+		sort.SliceStable(postChanges, func(i, j int) bool { return globalPostRank(postChanges[i]) < globalPostRank(postChanges[j]) })
+		postSteps := make([]plan.Step, 0, len(postChanges))
+		for _, change := range postChanges {
+			postSteps = append(postSteps, plan.Step{SQL: change.SQL, Type: change.Type, Operation: change.Operation, Path: change.Path})
 		}
 		migrationPlan.SourceGlobalFingerprint = globalFingerprint
 		migrationPlan.SourceDiffs = append(globalDiffs, migrationPlan.SourceDiffs...)
-		migrationPlan.PrependSteps(steps)
+		migrationPlan.PrependSteps(preSteps)
+		migrationPlan.AppendSteps(postSteps)
 	}
 
 	return migrationPlan, nil
@@ -456,6 +477,10 @@ func globalChangeDiff(change globalstate.Change) diff.Diff {
 	diffType := diff.DiffTypeRole
 	if change.Type == "role_membership" {
 		diffType = diff.DiffTypeRoleMembership
+	} else if change.Type == "ownership" {
+		diffType = diff.DiffTypeOwnership
+	} else if change.Type == "global_default_privilege" {
+		diffType = diff.DiffTypeGlobalDefaultPrivilege
 	}
 	operation := diff.DiffOperationAlter
 	switch change.Operation {
@@ -469,6 +494,25 @@ func globalChangeDiff(change globalstate.Change) diff.Diff {
 		Type:       diffType,
 		Operation:  operation,
 		Path:       change.Path,
+	}
+}
+
+func globalPostRank(change globalstate.Change) int {
+	switch change.Type {
+	case "ownership":
+		if strings.HasPrefix(change.Path, "schema/") {
+			return 0
+		}
+		if strings.HasPrefix(change.Path, "database/") {
+			return 3
+		}
+		return 1
+	case "global_default_privilege":
+		return 2
+	case "role":
+		return 4
+	default:
+		return 2
 	}
 }
 

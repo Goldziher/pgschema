@@ -61,6 +61,7 @@ type Plan struct {
 	// Source database fingerprint when plan was created
 	SourceFingerprint       *fingerprint.SchemaFingerprint `json:"source_fingerprint,omitempty"`
 	SourceGlobalFingerprint *globalstate.Fingerprint       `json:"source_global_fingerprint,omitempty"`
+	SourceInspectionRole    string                         `json:"source_inspection_role,omitempty"`
 
 	// Groups is the ordered list of execution groups
 	Groups []ExecutionGroup `json:"groups"`
@@ -93,6 +94,8 @@ const (
 	TypeSchema                  Type = "schemas"
 	TypeRole                    Type = "roles"
 	TypeRoleMembership          Type = "role memberships"
+	TypeOwnership               Type = "ownerships"
+	TypeGlobalDefaultPrivilege  Type = "global default privileges"
 	TypeType                    Type = "types"
 	TypeFunction                Type = "functions"
 	TypeProcedure               Type = "procedures"
@@ -127,6 +130,8 @@ func getObjectOrder() []Type {
 	return []Type{
 		TypeRole,
 		TypeRoleMembership,
+		TypeOwnership,
+		TypeGlobalDefaultPrivilege,
 		TypeSchema,
 		TypeDefaultPrivilege,
 		TypeType,
@@ -154,6 +159,14 @@ func (p *Plan) PrependSteps(steps []Step) {
 		return
 	}
 	p.Groups = append([]ExecutionGroup{{Steps: steps}}, p.Groups...)
+}
+
+// AppendSteps adds steps that must run after schema-local changes.
+func (p *Plan) AppendSteps(steps []Step) {
+	if len(steps) == 0 {
+		return
+	}
+	p.Groups = append(p.Groups, ExecutionGroup{Steps: steps})
 }
 
 // ========== PUBLIC METHODS ==========

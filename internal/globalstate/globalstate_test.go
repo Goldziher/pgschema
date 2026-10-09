@@ -32,8 +32,8 @@ member = "app_login"
 	require.Equal(t, Manifest{
 		Version: 1,
 		Roles: []Role{
-			{Name: "app_login", State: StatePresent, Login: true, Inherit: true, ConnectionLimit: -1},
-			{Name: "provider_admin", State: StateExternal, Inherit: true, ConnectionLimit: -1},
+			{Name: "app_login", State: StatePresent, Login: true, Inherit: true, ConnectionLimit: -1, ValidUntil: "infinity"},
+			{Name: "provider_admin", State: StateExternal, Inherit: true, ConnectionLimit: -1, ValidUntil: "infinity"},
 		},
 		Memberships: []Membership{{
 			Role: "app_group", Member: "app_login", State: StatePresent, Inherit: true, Set: true,
@@ -69,13 +69,13 @@ func TestPlanChangesCreatesAndAltersRolesBeforeMemberships(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []Change{
 		{
-			SQL:       `CREATE ROLE app_group WITH NOLOGIN INHERIT NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1`,
+			SQL:       `CREATE ROLE app_group WITH NOSUPERUSER NOLOGIN INHERIT NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1 VALID UNTIL 'infinity'`,
 			Type:      "role",
 			Operation: "create",
 			Path:      "app_group",
 		},
 		{
-			SQL:       `ALTER ROLE app_login WITH LOGIN INHERIT NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 12`,
+			SQL:       `ALTER ROLE app_login WITH NOSUPERUSER LOGIN INHERIT NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 12 VALID UNTIL 'infinity'; ALTER ROLE app_login RESET ALL`,
 			Type:      "role",
 			Operation: "alter",
 			Path:      "app_login",
@@ -117,6 +117,28 @@ func TestPlanChangesPostgres15MembershipOptions(t *testing.T) {
 	require.Equal(t, `REVOKE ADMIN OPTION FOR app_group FROM app_login`, changes[0].SQL)
 }
 
+func TestPlanChangesRejectsMaintainDefaultPrivilegeBeforePostgres17(t *testing.T) {
+	manifest := Manifest{
+		Version: 1,
+		Roles:   []Role{{Name: "app_owner", State: StateExternal}},
+		DefaultPrivileges: []DefaultPrivilege{{
+			Owner: "app_owner", ObjectType: "tables", Grantee: "PUBLIC",
+			Privileges: []string{"MAINTAIN"}, State: StatePresent,
+		}},
+	}
+	current := Snapshot{
+		SessionRole: RoleState{Name: "postgres", Superuser: true},
+		Roles:       map[string]RoleState{"app_owner": {Name: "app_owner"}},
+	}
+
+	_, err := PlanChanges(manifest, current, 16)
+	require.ErrorContains(t, err, "PostgreSQL 17 or newer")
+	changes, err := PlanChanges(manifest, current, 17)
+	require.NoError(t, err)
+	require.Len(t, changes, 1)
+	require.Contains(t, changes[0].SQL, "GRANT MAINTAIN ON TABLES")
+}
+
 func TestPlanChangesValidatesExternalRolesAndLeavesUnmanagedRolesAlone(t *testing.T) {
 	manifest := Manifest{
 		Version: 1,
@@ -155,4 +177,193 @@ func TestFingerprintIsDeterministicAndScoped(t *testing.T) {
 	fingerprintTwo, err := ComputeFingerprint(two, selection)
 	require.NoError(t, err)
 	require.Equal(t, fingerprintOne, fingerprintTwo)
+}
+
+func TestFingerprintIncludesOnlyRelevantApplyingAuthority(t *testing.T) {
+	selection := Selection{
+		Roles:     []string{"app_owner"},
+		Ownership: []Ownership{{Kind: "table", Name: "public.documents", Owner: "app_owner"}},
+	}
+	base := Snapshot{
+		SessionRole:       RoleState{Name: "deployer", CreateRole: true},
+		SessionAdminRoles: map[string]bool{"app_owner": true},
+		SessionSetRoles:   map[string]bool{"app_owner": true},
+		Roles:             map[string]RoleState{"app_owner": {Name: "app_owner"}},
+		Ownership: map[string]OwnershipState{
+			"table/public.documents": {Kind: "table", Name: "public.documents", Owner: "existing_owner"},
+		},
+	}
+	withUnrelatedAuthority := base
+	withUnrelatedAuthority.SessionAdminRoles = map[string]bool{"app_owner": true, "unmanaged": true}
+	withUnrelatedAuthority.SessionSetRoles = map[string]bool{"app_owner": true, "unmanaged": true}
+
+	baseFingerprint, err := ComputeFingerprint(base, selection)
+	require.NoError(t, err)
+	unrelatedFingerprint, err := ComputeFingerprint(withUnrelatedAuthority, selection)
+	require.NoError(t, err)
+	require.Equal(t, baseFingerprint.Hash, unrelatedFingerprint.Hash)
+
+	withoutCurrentOwnerAuthority := base
+	withoutCurrentOwnerAuthority.SessionSetRoles = map[string]bool{"app_owner": true}
+	base.SessionSetRoles["existing_owner"] = true
+	withCurrentOwnerAuthority, err := ComputeFingerprint(base, selection)
+	require.NoError(t, err)
+	withoutCurrentOwner, err := ComputeFingerprint(withoutCurrentOwnerAuthority, selection)
+	require.NoError(t, err)
+	require.NotEqual(t, withCurrentOwnerAuthority.Hash, withoutCurrentOwner.Hash)
+}
+
+func TestPlanChangesConvergesRoleLifecycleOwnershipAndGlobalDefaults(t *testing.T) {
+	manifest := Manifest{
+		Version: 1,
+		Roles: []Role{
+			{Name: "app_owner", State: StatePresent, Inherit: true, ConnectionLimit: -1, ValidUntil: "2030-01-02T03:04:05Z", Configuration: map[string]string{"statement_timeout": "5s"}},
+			{Name: "app_reader", State: StateExternal},
+			{Name: "retired_role", State: StateAbsent},
+		},
+		Ownership:         []Ownership{{Kind: "table", Name: "public.documents", Owner: "app_owner"}},
+		DefaultPrivileges: []DefaultPrivilege{{Owner: "app_owner", ObjectType: "tables", Grantee: "app_reader", Privileges: []string{"SELECT"}, State: StatePresent}},
+	}
+	current := Snapshot{
+		SessionRole: RoleState{Name: "postgres", Superuser: true},
+		Roles: map[string]RoleState{
+			"app_owner":    {Name: "app_owner", Inherit: true, ConnectionLimit: -1, ValidUntil: "infinity"},
+			"app_reader":   {Name: "app_reader"},
+			"retired_role": {Name: "retired_role"},
+		},
+		Ownership: map[string]OwnershipState{
+			"table/public.documents": {Kind: "table", Name: "public.documents", Owner: "postgres"},
+		},
+		DefaultPrivileges: map[string]DefaultPrivilegeState{},
+	}
+
+	changes, err := PlanChanges(manifest, current, 18)
+	require.NoError(t, err)
+	require.Equal(t, `ALTER ROLE app_owner WITH NOSUPERUSER NOLOGIN INHERIT NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1 VALID UNTIL '2030-01-02T03:04:05Z'; ALTER ROLE app_owner RESET ALL; ALTER ROLE app_owner SET statement_timeout TO '5s'`, changes[0].SQL)
+	require.Equal(t, "post", changes[1].Phase)
+	require.Equal(t, `DROP ROLE retired_role`, changes[1].SQL)
+	require.Equal(t, `ALTER TABLE public.documents OWNER TO app_owner`, changes[2].SQL)
+	require.Equal(t, `ALTER DEFAULT PRIVILEGES FOR ROLE app_owner REVOKE ALL ON TABLES FROM app_reader; ALTER DEFAULT PRIVILEGES FOR ROLE app_owner GRANT SELECT ON TABLES TO app_reader`, changes[3].SQL)
+}
+
+func TestPlanChangesRejectsRoleMutationWithoutAuthority(t *testing.T) {
+	manifest := Manifest{Version: 1, Roles: []Role{{Name: "app", State: StatePresent, Inherit: true, ConnectionLimit: -1}}}
+	current := Snapshot{SessionRole: RoleState{Name: "deployer"}, Roles: map[string]RoleState{}}
+
+	_, err := PlanChanges(manifest, current, 18)
+	require.ErrorContains(t, err, `session role "deployer" lacks CREATEROLE`)
+}
+
+func TestPlanChangesRevokesImplicitPublicFunctionExecute(t *testing.T) {
+	manifest := Manifest{
+		Version: 1,
+		Roles:   []Role{{Name: "app_owner", State: StateExternal}},
+		DefaultPrivileges: []DefaultPrivilege{{
+			Owner: "app_owner", ObjectType: "functions", Grantee: "PUBLIC", State: StateAbsent,
+		}},
+	}
+	current := Snapshot{
+		SessionRole: RoleState{Name: "postgres", Superuser: true},
+		Roles:       map[string]RoleState{"app_owner": {Name: "app_owner"}},
+		DefaultPrivileges: map[string]DefaultPrivilegeState{
+			"app_owner/functions/PUBLIC": {
+				Owner: "app_owner", ObjectType: "functions", Grantee: "PUBLIC",
+				Privileges: map[string]bool{"EXECUTE": false},
+			},
+		},
+	}
+
+	changes, err := PlanChanges(manifest, current, 18)
+	require.NoError(t, err)
+	require.Len(t, changes, 1, "implicit baseline must be compared, not treated as an empty ACL")
+	require.Equal(t, "ALTER DEFAULT PRIVILEGES FOR ROLE app_owner REVOKE ALL ON FUNCTIONS FROM PUBLIC", changes[0].SQL)
+}
+
+func TestPlanChangesRejectsUnprovenOwnershipAuthorityAndExtensionMembers(t *testing.T) {
+	manifest := Manifest{
+		Version:   1,
+		Roles:     []Role{{Name: "app_owner", State: StateExternal}},
+		Ownership: []Ownership{{Kind: "table", Name: "public.documents", Owner: "app_owner"}},
+	}
+	current := Snapshot{
+		SessionRole: RoleState{Name: "deployer", CreateRole: true},
+		Roles:       map[string]RoleState{"app_owner": {Name: "app_owner"}},
+		Ownership: map[string]OwnershipState{
+			"table/public.documents": {Kind: "table", Name: "public.documents", Owner: "existing_owner"},
+		},
+	}
+
+	_, err := PlanChanges(manifest, current, 18)
+	require.ErrorContains(t, err, "cannot assume current owner role")
+
+	current.SessionRole.Superuser = true
+	current.Ownership["table/public.documents"] = OwnershipState{
+		Kind: "table", Name: "public.documents", Owner: "existing_owner", ExtensionOwned: true,
+	}
+	_, err = PlanChanges(manifest, current, 18)
+	require.ErrorContains(t, err, "extension member")
+}
+
+func TestPlanChangesRequiresDeclaredSetMembershipForNewOwner(t *testing.T) {
+	manifest := Manifest{
+		Version: 1,
+		Roles: []Role{
+			{Name: "app_owner", State: StatePresent, Inherit: true, ConnectionLimit: -1},
+			{Name: "deployer", State: StateExternal},
+		},
+		Ownership: []Ownership{{Kind: "table", Name: "public.documents", Owner: "app_owner"}},
+		DefaultPrivileges: []DefaultPrivilege{{
+			Owner: "app_owner", ObjectType: "functions", Grantee: "PUBLIC", State: StateAbsent,
+		}},
+	}
+	current := Snapshot{
+		SessionRole:       RoleState{Name: "deployer", CreateRole: true},
+		SessionAdminRoles: map[string]bool{},
+		SessionSetRoles:   map[string]bool{},
+		Roles:             map[string]RoleState{"deployer": {Name: "deployer"}},
+		Ownership:         map[string]OwnershipState{},
+		DefaultPrivileges: map[string]DefaultPrivilegeState{
+			"app_owner/functions/PUBLIC": {
+				Owner: "app_owner", ObjectType: "functions", Grantee: "PUBLIC",
+				Privileges: map[string]bool{"EXECUTE": false},
+			},
+		},
+	}
+
+	_, err := PlanChanges(manifest, current, 18)
+	require.ErrorContains(t, err, "declare a SET-enabled membership")
+
+	manifest.Memberships = []Membership{{
+		Role: "app_owner", Member: "deployer", State: StatePresent, Admin: true, Inherit: false, Set: true,
+	}}
+	changes, err := PlanChanges(manifest, current, 18)
+	require.NoError(t, err)
+	require.Len(t, changes, 4)
+	require.Equal(t, "role_membership", changes[1].Type)
+	require.Equal(t, "ownership", changes[2].Type)
+	require.Equal(t, "global_default_privilege", changes[3].Type)
+	require.Contains(t, changes[3].SQL, "SET ROLE app_owner")
+}
+
+func TestPlanChangesConvergesAndProtectsSuperuserState(t *testing.T) {
+	manifest := Manifest{
+		Version: 1,
+		Roles:   []Role{{Name: "app", State: StatePresent, Inherit: true, ConnectionLimit: -1}},
+	}
+	current := Snapshot{
+		SessionRole: RoleState{Name: "postgres", Superuser: true},
+		Roles: map[string]RoleState{
+			"app": {Name: "app", Superuser: true, Inherit: true, ConnectionLimit: -1, ValidUntil: "infinity"},
+		},
+	}
+
+	changes, err := PlanChanges(manifest, current, 18)
+	require.NoError(t, err)
+	require.Len(t, changes, 1)
+	require.Contains(t, changes[0].SQL, "NOSUPERUSER")
+
+	current.SessionRole = RoleState{Name: "deployer", CreateRole: true}
+	current.SessionAdminRoles = map[string]bool{"app": true}
+	_, err = PlanChanges(manifest, current, 18)
+	require.ErrorContains(t, err, "must be superuser")
 }
