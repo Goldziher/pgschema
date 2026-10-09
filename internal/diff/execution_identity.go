@@ -121,7 +121,13 @@ func aggregateOwnerIdentity(aggregate *ir.Aggregate) OwnerIdentity {
 	if aggregate == nil {
 		return OwnerIdentity{}
 	}
-	return routineOwnerIdentity(aggregate.Schema, aggregate.Name, aggregate.Arguments, "a")
+	return OwnerIdentity{
+		Kind:                   OwnerIdentityRoutine,
+		Schema:                 aggregate.Schema,
+		Name:                   aggregate.Name + "(" + aggregate.Arguments + ")",
+		RoutineKind:            "a",
+		CatalogRoutineIdentity: true,
+	}
 }
 
 func routineOwnerIdentity(schema, name, arguments, kind string) OwnerIdentity {

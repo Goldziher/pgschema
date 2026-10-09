@@ -68,7 +68,35 @@ func TestReviewZeroArgumentAggregateUsesCatalogIdentity(t *testing.T) {
 	require.Len(t, groups, 1)
 	require.Len(t, groups[0].Steps, 1)
 	require.Equal(t, diff.OwnerIdentity{
-		Kind: diff.OwnerIdentityRoutine, Schema: "audit.log", Name: "row.count", RoutineKind: "a",
+		Kind:                   diff.OwnerIdentityRoutine,
+		Schema:                 "audit.log",
+		Name:                   "row.count()",
+		RoutineKind:            "a",
+		CatalogRoutineIdentity: true,
+	}, groups[0].Steps[0].OwnerIdentity)
+}
+
+func TestReviewOrderedSetAggregatePreservesOrderByIdentity(t *testing.T) {
+	aggregate := &ir.Aggregate{
+		Schema: "audit.log", Name: "ordered.dot", Arguments: "integer ORDER BY custom_type",
+	}
+	diffs := []diff.Diff{{
+		Statements: []diff.SQLStatement{{SQL: `COMMENT ON AGGREGATE "ordered.dot" (integer ORDER BY custom_type) IS 'ordered';`}},
+		Type:       diff.DiffTypeAggregate,
+		Operation:  diff.DiffOperationAlter,
+		Path:       "audit.log.ordered.dot",
+		Source:     aggregate,
+	}}
+
+	groups := groupDiffs(diffs, 15, nil)
+	require.Len(t, groups, 1)
+	require.Len(t, groups[0].Steps, 1)
+	require.Equal(t, diff.OwnerIdentity{
+		Kind:                   diff.OwnerIdentityRoutine,
+		Schema:                 "audit.log",
+		Name:                   "ordered.dot(integer ORDER BY custom_type)",
+		RoutineKind:            "a",
+		CatalogRoutineIdentity: true,
 	}, groups[0].Steps[0].OwnerIdentity)
 }
 

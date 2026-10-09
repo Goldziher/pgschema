@@ -166,6 +166,18 @@ CREATE AGGREGATE managed."custom.aggregate" (managed.custom_type) (
   SFUNC = managed."custom.transition", STYPE = bigint, INITCOND = '0'
 );
 ALTER AGGREGATE managed."custom.aggregate" (managed.custom_type) OWNER TO deployer;
+CREATE FUNCTION managed."ordered.transition"(state bigint, value managed.custom_type) RETURNS bigint LANGUAGE sql AS 'SELECT state + 1';
+ALTER FUNCTION managed."ordered.transition"(bigint, managed.custom_type) OWNER TO deployer;
+CREATE AGGREGATE managed."ordered.dot" (ORDER BY managed.custom_type) (
+  SFUNC = managed."ordered.transition", STYPE = bigint, INITCOND = '0'
+);
+ALTER AGGREGATE managed."ordered.dot" (ORDER BY managed.custom_type) OWNER TO deployer;
+CREATE FUNCTION managed."hypothetical.transition"(state bigint, value managed.custom_type) RETURNS bigint LANGUAGE sql AS 'SELECT state + 1';
+ALTER FUNCTION managed."hypothetical.transition"(bigint, managed.custom_type) OWNER TO deployer;
+CREATE AGGREGATE managed."hypothetical.dot" (managed.custom_type ORDER BY managed.custom_type) (
+  SFUNC = managed."hypothetical.transition", STYPE = bigint, INITCOND = '0', HYPOTHETICAL
+);
+ALTER AGGREGATE managed."hypothetical.dot" (managed.custom_type ORDER BY managed.custom_type) OWNER TO deployer;
 CREATE AGGREGATE managed."row.count" (*) (SFUNC = int8inc, STYPE = bigint, INITCOND = '0');
 ALTER AGGREGATE managed."row.count" (*) OWNER TO deployer;
 `)
@@ -194,6 +206,16 @@ CREATE AGGREGATE "custom.aggregate" (custom_type) (
   SFUNC = "custom.transition", STYPE = bigint, INITCOND = '0'
 );
 COMMENT ON AGGREGATE "custom.aggregate" (custom_type) IS 'managed aggregate';
+CREATE FUNCTION "ordered.transition"(state bigint, value custom_type) RETURNS bigint LANGUAGE sql AS 'SELECT state + 1';
+CREATE AGGREGATE "ordered.dot" (ORDER BY custom_type) (
+  SFUNC = "ordered.transition", STYPE = bigint, INITCOND = '0'
+);
+COMMENT ON AGGREGATE "ordered.dot" (ORDER BY custom_type) IS 'managed ordered aggregate';
+CREATE FUNCTION "hypothetical.transition"(state bigint, value custom_type) RETURNS bigint LANGUAGE sql AS 'SELECT state + 1';
+CREATE AGGREGATE "hypothetical.dot" (custom_type ORDER BY custom_type) (
+  SFUNC = "hypothetical.transition", STYPE = bigint, INITCOND = '0', HYPOTHETICAL
+);
+COMMENT ON AGGREGATE "hypothetical.dot" (custom_type ORDER BY custom_type) IS 'managed hypothetical aggregate';
 CREATE AGGREGATE "row.count" (*) (SFUNC = int8inc, STYPE = bigint, INITCOND = '0');
 COMMENT ON AGGREGATE "row.count" (*) IS 'managed count';
 GRANT SELECT ON TABLE "audit.log" TO "app.reader";
@@ -270,6 +292,20 @@ SELECT EXISTS (
 	var customAggregateComment string
 	require.NoError(t, admin.QueryRowContext(ctx, `SELECT obj_description('managed."custom.aggregate"(managed.custom_type)'::regprocedure, 'pg_proc')`).Scan(&customAggregateComment))
 	require.Equal(t, "managed aggregate", customAggregateComment)
+	var orderedAggregateComment string
+	require.NoError(t, admin.QueryRowContext(ctx, `
+SELECT obj_description(p.oid, 'pg_proc')
+FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'managed' AND p.proname = 'ordered.dot' AND p.prokind = 'a'
+`).Scan(&orderedAggregateComment))
+	require.Equal(t, "managed ordered aggregate", orderedAggregateComment)
+	var hypotheticalAggregateComment string
+	require.NoError(t, admin.QueryRowContext(ctx, `
+SELECT obj_description(p.oid, 'pg_proc')
+FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'managed' AND p.proname = 'hypothetical.dot' AND p.prokind = 'a'
+`).Scan(&hypotheticalAggregateComment))
+	require.Equal(t, "managed hypothetical aggregate", hypotheticalAggregateComment)
 	var aggregateComment string
 	require.NoError(t, admin.QueryRowContext(ctx, `SELECT obj_description('managed."row.count"()'::regprocedure, 'pg_proc')`).Scan(&aggregateComment))
 	require.Equal(t, "managed count", aggregateComment)
