@@ -214,6 +214,18 @@ func TestFingerprintIncludesOnlyRelevantApplyingAuthority(t *testing.T) {
 	withoutCurrentOwner, err := ComputeFingerprint(withoutCurrentOwnerAuthority, selection)
 	require.NoError(t, err)
 	require.NotEqual(t, withCurrentOwnerAuthority.Hash, withoutCurrentOwner.Hash)
+
+	ref := ownershipKey("schema", "managed")
+	selection.Ownership = []Ownership{{Kind: "schema", Name: "managed", Owner: "app_owner"}}
+	withExecutorCreate := base
+	withExecutorCreate.OwnershipExecutorCreatePrivileges = map[OwnershipRef]bool{ref: true}
+	withoutExecutorCreate := base
+	withoutExecutorCreate.OwnershipExecutorCreatePrivileges = map[OwnershipRef]bool{ref: false}
+	withExecutorCreateFingerprint, err := ComputeFingerprint(withExecutorCreate, selection)
+	require.NoError(t, err)
+	withoutExecutorCreateFingerprint, err := ComputeFingerprint(withoutExecutorCreate, selection)
+	require.NoError(t, err)
+	require.NotEqual(t, withExecutorCreateFingerprint.Hash, withoutExecutorCreateFingerprint.Hash)
 }
 
 func TestPlanChangesConvergesRoleLifecycleOwnershipAndGlobalDefaults(t *testing.T) {

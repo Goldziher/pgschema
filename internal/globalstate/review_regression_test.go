@@ -306,7 +306,7 @@ func TestReviewOwnershipTransferValidatesEffectiveExecutorAndNewOwner(t *testing
 	current.NewOwnerCreatePrivileges[ref] = false
 	current.Roles["new_owner"] = RoleState{Name: "new_owner"}
 	_, err = PlanChanges(manifest, current, 18)
-	require.ErrorContains(t, err, `new owner role "new_owner" lacks required CREATE authority for database "app"`)
+	require.ErrorContains(t, err, `new owner role "new_owner" lacks CREATEDB required to change database ownership`)
 
 	current.NewOwnerCreatePrivileges[ref] = true
 	_, err = PlanChanges(manifest, current, 18)

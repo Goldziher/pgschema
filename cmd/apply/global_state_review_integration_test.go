@@ -10,6 +10,7 @@ import (
 	planCmd "github.com/pgplex/pgschema/cmd/plan"
 	"github.com/pgplex/pgschema/cmd/util"
 	"github.com/pgplex/pgschema/internal/globalstate"
+	"github.com/pgplex/pgschema/ir"
 	"github.com/pgplex/pgschema/testutil"
 	"github.com/stretchr/testify/require"
 )
@@ -324,4 +325,121 @@ CREATE ROLE new_owner CREATEDB;
 	require.NoError(t, err)
 	require.Len(t, changes, 1)
 	require.Contains(t, changes[0].SQL, `SET ROLE old_owner; ALTER DATABASE review_owned_db OWNER TO new_owner; RESET ROLE`)
+}
+
+func TestReviewSchemaOwnershipTransferUsesEffectiveExecutorCreateAuthority(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	tests := []struct {
+		name              string
+		createRole        string
+		wantPlanningError bool
+	}{
+		{name: "current owner has CREATE", createRole: "old_owner"},
+		{name: "only new owner has CREATE", createRole: "new_owner", wantPlanningError: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			target := testutil.SetupPostgres(t)
+			defer target.Stop()
+			admin, host, port, database, _, _ := testutil.ConnectToPostgres(t, target)
+			defer admin.Close()
+			majorVersion, err := detectPostgresMajorVersion(admin)
+			require.NoError(t, err)
+
+			_, err = admin.ExecContext(ctx, `
+CREATE ROLE deployer LOGIN NOINHERIT CREATEROLE PASSWORD 'deployer-pass';
+CREATE ROLE old_owner NOINHERIT;
+CREATE ROLE new_owner NOINHERIT;
+CREATE SCHEMA managed AUTHORIZATION old_owner;
+CREATE TABLE managed.documents (id bigint PRIMARY KEY);
+ALTER TABLE managed.documents OWNER TO old_owner;
+`)
+			require.NoError(t, err)
+			_, err = admin.ExecContext(ctx, fmt.Sprintf(
+				"REVOKE CREATE ON DATABASE %s FROM PUBLIC, old_owner, new_owner; GRANT CREATE ON DATABASE %s TO %s",
+				ir.QuoteIdentifier(database), ir.QuoteIdentifier(database), ir.QuoteIdentifier(tt.createRole),
+			))
+			require.NoError(t, err)
+			grantOldOwner := "GRANT old_owner TO deployer"
+			grantNewOwner := "GRANT new_owner TO deployer"
+			grantTransition := "GRANT new_owner TO old_owner"
+			if majorVersion >= 16 {
+				grantOldOwner += " WITH ADMIN FALSE, INHERIT FALSE, SET TRUE"
+				grantNewOwner += " WITH ADMIN FALSE, INHERIT FALSE, SET TRUE"
+				grantTransition += " WITH ADMIN FALSE, INHERIT FALSE, SET TRUE"
+			}
+			_, err = admin.ExecContext(ctx, fmt.Sprintf("%s;\n%s;\n%s;", grantOldOwner, grantNewOwner, grantTransition))
+			require.NoError(t, err)
+
+			dir := t.TempDir()
+			schemaFile := filepath.Join(dir, "schema.sql")
+			require.NoError(t, os.WriteFile(schemaFile, []byte("CREATE TABLE documents (id bigint PRIMARY KEY);\n"), 0o600))
+			globalFile := filepath.Join(dir, "global.toml")
+			membershipOptions := ""
+			if majorVersion >= 16 {
+				membershipOptions = "inherit = false\nset = true\n"
+			}
+			require.NoError(t, os.WriteFile(globalFile, []byte(fmt.Sprintf(`
+version = 1
+
+[[roles]]
+name = "deployer"
+state = "external"
+
+[[roles]]
+name = "old_owner"
+state = "external"
+
+[[roles]]
+name = "new_owner"
+state = "external"
+
+[[memberships]]
+role = "old_owner"
+member = "deployer"
+%s
+[[memberships]]
+role = "new_owner"
+member = "deployer"
+%s
+[[memberships]]
+role = "new_owner"
+member = "old_owner"
+%s
+[[ownership]]
+kind = "schema"
+name = "managed"
+owner = "new_owner"
+`, membershipOptions, membershipOptions, membershipOptions)), 0o600))
+			config := &planCmd.PlanConfig{
+				Host: host, Port: port, DB: database, User: "deployer", Password: "deployer-pass",
+				Schema: "managed", File: schemaFile, GlobalFile: globalFile,
+				ApplicationName: "pgschema-review-schema-create-authority-test", SSLMode: "disable",
+			}
+			migrationPlan, err := planCmd.GeneratePlan(config, sharedEmbeddedPG)
+			if tt.wantPlanningError {
+				require.ErrorContains(t, err, `current owner role "old_owner" lacks required CREATE authority`)
+				var owner string
+				require.NoError(t, admin.QueryRowContext(ctx,
+					`SELECT pg_catalog.pg_get_userbyid(nspowner) FROM pg_catalog.pg_namespace WHERE nspname = 'managed'`,
+				).Scan(&owner))
+				require.Equal(t, "old_owner", owner)
+				return
+			}
+			require.NoError(t, err)
+			require.NoError(t, ApplyMigration(&ApplyConfig{
+				Host: host, Port: port, DB: database, User: "deployer", Password: "deployer-pass",
+				Schema: "managed", Plan: migrationPlan, AutoApprove: true, Quiet: true,
+				ApplicationName: "pgschema-review-schema-create-authority-test", SSLMode: "disable",
+			}, nil))
+			var owner string
+			require.NoError(t, admin.QueryRowContext(ctx,
+				`SELECT pg_catalog.pg_get_userbyid(nspowner) FROM pg_catalog.pg_namespace WHERE nspname = 'managed'`,
+			).Scan(&owner))
+			require.Equal(t, "new_owner", owner)
+		})
+	}
 }

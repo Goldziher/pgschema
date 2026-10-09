@@ -291,6 +291,10 @@ func preflightRoleAuthority(manifest Manifest, current Snapshot, changes []Chang
 			object := *change.Ownership
 			ref := ownershipKey(object.Kind, object.Name)
 			actual, exists := current.Ownership[ref]
+			executor := current.SessionRole.Name
+			if exists && actual.Owner != current.SessionRole.Name {
+				executor = actual.Owner
+			}
 			if exists && actual.Owner != current.SessionRole.Name && !current.SessionSetRoles[actual.Owner] &&
 				!plannedSet[MembershipKey(actual.Owner, current.SessionRole.Name)] {
 				return fmt.Errorf("session role %q cannot assume current owner role %q for %s", current.SessionRole.Name, actual.Owner, change.Path)
@@ -312,7 +316,15 @@ func preflightRoleAuthority(manifest Manifest, current Snapshot, changes []Chang
 					return fmt.Errorf("session role %q lacks CREATEDB required to change database ownership", current.SessionRole.Name)
 				}
 			}
-			if !current.NewOwnerCreatePrivileges[ref] && !plannedOwnerCreateAuthority(manifest, current, object) {
+			if object.Kind == "database" && !current.NewOwnerCreatePrivileges[ref] &&
+				!plannedNewOwnerCreateAuthority(manifest, current, object) {
+				return fmt.Errorf("new owner role %q lacks CREATEDB required to change database ownership", object.Owner)
+			}
+			if object.Kind == "schema" && !current.OwnershipExecutorCreatePrivileges[ref] {
+				return fmt.Errorf("current owner role %q lacks required CREATE authority for %s %q", executor, object.Kind, object.Name)
+			}
+			if object.Kind != "database" && object.Kind != "schema" &&
+				!current.NewOwnerCreatePrivileges[ref] && !plannedNewOwnerCreateAuthority(manifest, current, object) {
 				return fmt.Errorf("new owner role %q lacks required CREATE authority for %s %q", object.Owner, object.Kind, object.Name)
 			}
 		case "global_default_privilege":
@@ -372,7 +384,7 @@ func ValidateExecutionRole(manifest Manifest, current Snapshot, executionRole st
 	return fmt.Errorf("session role %q lacks SET authority on schema execution role %q; declare a SET-enabled membership", current.SessionRole.Name, executionRole)
 }
 
-func plannedOwnerCreateAuthority(manifest Manifest, current Snapshot, object Ownership) bool {
+func plannedNewOwnerCreateAuthority(manifest Manifest, current Snapshot, object Ownership) bool {
 	if object.Kind == "database" {
 		for _, role := range manifest.Roles {
 			if role.Name == object.Owner && role.State == StatePresent && role.CreateDB {
@@ -381,10 +393,6 @@ func plannedOwnerCreateAuthority(manifest Manifest, current Snapshot, object Own
 		}
 		role := current.Roles[object.Owner]
 		return role.Superuser || role.CreateDB
-	}
-	if object.Kind == "schema" {
-		return current.DatabaseName != "" &&
-			manifestTransfersContainerOwnership(manifest, "database", current.DatabaseName, object.Owner)
 	}
 	schema := ""
 	if object.Kind == "function" || object.Kind == "procedure" {
