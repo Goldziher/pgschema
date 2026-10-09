@@ -11,6 +11,7 @@ import (
 	"github.com/pgplex/pgschema/cmd/util"
 	"github.com/pgplex/pgschema/internal/diff"
 	"github.com/pgplex/pgschema/internal/fingerprint"
+	"github.com/pgplex/pgschema/internal/globalstate"
 	"github.com/pgplex/pgschema/internal/include"
 	"github.com/pgplex/pgschema/internal/plan"
 	"github.com/pgplex/pgschema/internal/postgres"
@@ -19,17 +20,18 @@ import (
 )
 
 var (
-	planHost     string
-	planPort     int
-	planDB       string
-	planUser     string
-	planPassword string
-	planSchema   string
-	planFile     string
-	outputHuman  string
-	outputJSON   string
-	outputSQL    string
-	planNoColor  bool
+	planHost       string
+	planPort       int
+	planDB         string
+	planUser       string
+	planPassword   string
+	planSchema     string
+	planFile       string
+	planGlobalFile string
+	outputHuman    string
+	outputJSON     string
+	outputSQL      string
+	planNoColor    bool
 
 	// Plan database flags (optional - if not provided, uses embedded postgres)
 	planDBHost     string
@@ -62,6 +64,7 @@ func init() {
 
 	// Desired state schema file flag
 	PlanCmd.Flags().StringVar(&planFile, "file", "", "Path to desired state SQL schema file (required)")
+	PlanCmd.Flags().StringVar(&planGlobalFile, "global-file", "", "Path to opt-in global state TOML file")
 
 	// Plan database connection flags (optional - for using external database instead of embedded postgres)
 	PlanCmd.Flags().StringVar(&planDBHost, "plan-host", "", "Plan database host (env: PGSCHEMA_PLAN_HOST). If provided, uses external database instead of embedded postgres")
@@ -135,6 +138,7 @@ func runPlan(cmd *cobra.Command, args []string) error {
 		Password:        finalPassword,
 		Schema:          planSchema,
 		File:            planFile,
+		GlobalFile:      planGlobalFile,
 		ApplicationName: "pgschema",
 		SSLMode:         finalSSLMode,
 		// Plan database configuration
@@ -184,6 +188,7 @@ type PlanConfig struct {
 	Password        string
 	Schema          string
 	File            string
+	GlobalFile      string
 	ApplicationName string
 	// Plan database configuration (optional - for external database)
 	PlanDBHost     string
@@ -290,6 +295,21 @@ func GeneratePlan(config *PlanConfig, provider postgres.DesiredStateProvider) (*
 	// reach role validation or the plan database (issues #602, #603).
 	desiredState = stripNoEffectStatements(warningWriter, desiredState)
 
+	var globalManifest *globalstate.Manifest
+	plannedRoles := make(map[string]bool)
+	if config.GlobalFile != "" {
+		manifest, err := globalstate.LoadManifest(config.GlobalFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load global state: %w", err)
+		}
+		globalManifest = &manifest
+		for _, role := range manifest.Roles {
+			if role.State == globalstate.StatePresent {
+				plannedRoles[role.Name] = true
+			}
+		}
+	}
+
 	// Get current state from target database
 	currentStateIR, err := util.GetIRFromDatabase(config.Host, config.Port, config.DB, config.User, config.Password, config.SSLMode, config.Schema, config.ApplicationName, ignoreConfig, "")
 	if err != nil {
@@ -332,7 +352,7 @@ func GeneratePlan(config *PlanConfig, provider postgres.DesiredStateProvider) (*
 
 	// Roles are cluster-global and unmanaged: the provider stubs the ones the
 	// schema references, but only roles the target has (issue #450).
-	if err := validateReferencedRoles(ctx, targetConnCfg, desiredState); err != nil {
+	if err := validateReferencedRoles(ctx, targetConnCfg, desiredState, plannedRoles); err != nil {
 		return nil, err
 	}
 
@@ -397,7 +417,59 @@ func GeneratePlan(config *PlanConfig, provider postgres.DesiredStateProvider) (*
 	// Create plan from diffs with fingerprint
 	migrationPlan := plan.NewPlanWithFingerprint(diffs, sourceFingerprint, targetMajorVersion, currentStateIR)
 
+	if globalManifest != nil {
+		selection := globalstate.SelectionFor(*globalManifest)
+		targetDB, err := util.Connect(targetConnCfg)
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect for global state inspection: %w", err)
+		}
+		defer targetDB.Close()
+		currentGlobalState, err := globalstate.Inspect(ctx, targetDB, selection, targetMajorVersion)
+		if err != nil {
+			return nil, err
+		}
+		globalFingerprint, err := globalstate.ComputeFingerprint(currentGlobalState, selection)
+		if err != nil {
+			return nil, err
+		}
+		globalChanges, err := globalstate.PlanChanges(*globalManifest, currentGlobalState, targetMajorVersion)
+		if err != nil {
+			return nil, fmt.Errorf("failed to plan global state: %w", err)
+		}
+		steps := make([]plan.Step, 0, len(globalChanges))
+		globalDiffs := make([]diff.Diff, 0, len(globalChanges))
+		for _, change := range globalChanges {
+			steps = append(steps, plan.Step{
+				SQL: change.SQL, Type: change.Type, Operation: change.Operation, Path: change.Path,
+			})
+			globalDiffs = append(globalDiffs, globalChangeDiff(change))
+		}
+		migrationPlan.SourceGlobalFingerprint = globalFingerprint
+		migrationPlan.SourceDiffs = append(globalDiffs, migrationPlan.SourceDiffs...)
+		migrationPlan.PrependSteps(steps)
+	}
+
 	return migrationPlan, nil
+}
+
+func globalChangeDiff(change globalstate.Change) diff.Diff {
+	diffType := diff.DiffTypeRole
+	if change.Type == "role_membership" {
+		diffType = diff.DiffTypeRoleMembership
+	}
+	operation := diff.DiffOperationAlter
+	switch change.Operation {
+	case "create":
+		operation = diff.DiffOperationCreate
+	case "drop":
+		operation = diff.DiffOperationDrop
+	}
+	return diff.Diff{
+		Statements: []diff.SQLStatement{{SQL: change.SQL}},
+		Type:       diffType,
+		Operation:  operation,
+		Path:       change.Path,
+	}
 }
 
 // outputSpec represents a single output specification

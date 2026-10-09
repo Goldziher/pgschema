@@ -11,6 +11,7 @@ import (
 	"github.com/pgplex/pgschema/internal/color"
 	"github.com/pgplex/pgschema/internal/diff"
 	"github.com/pgplex/pgschema/internal/fingerprint"
+	"github.com/pgplex/pgschema/internal/globalstate"
 	"github.com/pgplex/pgschema/internal/version"
 	"github.com/pgplex/pgschema/ir"
 )
@@ -58,7 +59,8 @@ type Plan struct {
 	CreatedAt time.Time `json:"created_at"`
 
 	// Source database fingerprint when plan was created
-	SourceFingerprint *fingerprint.SchemaFingerprint `json:"source_fingerprint,omitempty"`
+	SourceFingerprint       *fingerprint.SchemaFingerprint `json:"source_fingerprint,omitempty"`
+	SourceGlobalFingerprint *globalstate.Fingerprint       `json:"source_global_fingerprint,omitempty"`
 
 	// Groups is the ordered list of execution groups
 	Groups []ExecutionGroup `json:"groups"`
@@ -89,6 +91,8 @@ type Type string
 
 const (
 	TypeSchema                  Type = "schemas"
+	TypeRole                    Type = "roles"
+	TypeRoleMembership          Type = "role memberships"
 	TypeType                    Type = "types"
 	TypeFunction                Type = "functions"
 	TypeProcedure               Type = "procedures"
@@ -121,6 +125,8 @@ const (
 // getObjectOrder returns the dependency order for database objects
 func getObjectOrder() []Type {
 	return []Type{
+		TypeRole,
+		TypeRoleMembership,
 		TypeSchema,
 		TypeDefaultPrivilege,
 		TypeType,
@@ -140,6 +146,14 @@ func getObjectOrder() []Type {
 		TypeColumnPrivilege,
 		TypeRevokedDefaultPrivilege,
 	}
+}
+
+// PrependSteps adds steps that must run before schema-local changes.
+func (p *Plan) PrependSteps(steps []Step) {
+	if len(steps) == 0 {
+		return
+	}
+	p.Groups = append([]ExecutionGroup{{Steps: steps}}, p.Groups...)
 }
 
 // ========== PUBLIC METHODS ==========

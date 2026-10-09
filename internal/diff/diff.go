@@ -43,6 +43,8 @@ const (
 	DiffTypePrivilege
 	DiffTypeRevokedDefaultPrivilege
 	DiffTypeColumnPrivilege
+	DiffTypeRole
+	DiffTypeRoleMembership
 )
 
 // String returns the string representation of DiffType
@@ -106,6 +108,10 @@ func (d DiffType) String() string {
 		return "revoked_default_privilege"
 	case DiffTypeColumnPrivilege:
 		return "column_privilege"
+	case DiffTypeRole:
+		return "role"
+	case DiffTypeRoleMembership:
+		return "role_membership"
 	default:
 		return "unknown"
 	}
@@ -182,6 +188,10 @@ func (d *DiffType) UnmarshalJSON(data []byte) error {
 		*d = DiffTypeRevokedDefaultPrivilege
 	case "column_privilege":
 		*d = DiffTypeColumnPrivilege
+	case "role":
+		*d = DiffTypeRole
+	case "role_membership":
+		*d = DiffTypeRoleMembership
 	default:
 		return fmt.Errorf("unknown diff type: %s", s)
 	}

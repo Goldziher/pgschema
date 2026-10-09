@@ -138,6 +138,11 @@ By default, the plan command uses an embedded PostgreSQL instance to validate yo
   Path to desired state SQL schema file
 </ParamField>
 
+<ParamField path="--global-file" type="string">
+  Path to an opt-in TOML manifest for cluster-global roles and memberships.
+  Omitting this flag preserves the portable, schema-only behavior.
+</ParamField>
+
 <ParamField path="--output-human" type="string">
   Output human-readable format to stdout or file path
   
@@ -178,6 +183,47 @@ By default, the plan command uses an embedded PostgreSQL instance to validate yo
 ## Ignoring Objects
 
 You can exclude specific database objects from migration planning using a `.pgschemaignore` file. See [Ignore (.pgschemaignore)](/cli/ignore) for complete documentation.
+
+## Roles and memberships
+
+Use a separate global-state manifest when roles and role memberships are part of the desired state:
+
+```toml global.toml
+version = 1
+
+[[roles]]
+name = "app_group"
+
+[[roles]]
+name = "app_login"
+login = true
+connection_limit = 20
+
+[[roles]]
+name = "provider_admin"
+state = "external"
+
+[[memberships]]
+role = "app_group"
+member = "app_login"
+admin = false
+inherit = true
+set = true
+```
+
+```bash
+pgschema plan --file schema.sql --global-file global.toml --output-json plan.json
+```
+
+Declared roles manage `LOGIN`, `INHERIT`, `CREATEDB`, `CREATEROLE`, `REPLICATION`,
+`BYPASSRLS`, and connection limit. Omitted attributes use PostgreSQL's role defaults.
+An external role must exist, but pgschema never alters it. Memberships may use
+`state = "absent"` for an explicit revoke. PostgreSQL 15 supports the `ADMIN` option;
+per-membership `INHERIT` and `SET` options require PostgreSQL 16 or newer.
+
+Planning reads catalogs directly and does not apply the manifest to the target or plan
+database. Saved JSON plans include a fingerprint scoped to the declared roles and
+memberships, so `apply --plan` rejects concurrent changes before executing any step.
 
 ## Examples
 
