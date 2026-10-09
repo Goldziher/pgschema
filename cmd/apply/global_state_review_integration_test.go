@@ -154,6 +154,18 @@ CREATE FUNCTION managed."calculate.dot"(value integer) RETURNS integer LANGUAGE 
 ALTER FUNCTION managed."calculate.dot"(integer) OWNER TO deployer;
 CREATE FUNCTION managed."calculate.dot"(value text) RETURNS text LANGUAGE sql AS 'SELECT value';
 ALTER FUNCTION managed."calculate.dot"(text) OWNER TO app_owner;
+CREATE TYPE managed.custom_type AS ENUM ('one');
+ALTER TYPE managed.custom_type OWNER TO deployer;
+CREATE FUNCTION managed."custom.arg"(value managed.custom_type) RETURNS integer LANGUAGE sql AS 'SELECT 1';
+ALTER FUNCTION managed."custom.arg"(managed.custom_type) OWNER TO deployer;
+CREATE PROCEDURE managed."custom.proc"(value managed.custom_type) LANGUAGE sql AS 'SELECT 1';
+ALTER PROCEDURE managed."custom.proc"(managed.custom_type) OWNER TO deployer;
+CREATE FUNCTION managed."custom.transition"(state bigint, value managed.custom_type) RETURNS bigint LANGUAGE sql AS 'SELECT state + 1';
+ALTER FUNCTION managed."custom.transition"(bigint, managed.custom_type) OWNER TO deployer;
+CREATE AGGREGATE managed."custom.aggregate" (managed.custom_type) (
+  SFUNC = managed."custom.transition", STYPE = bigint, INITCOND = '0'
+);
+ALTER AGGREGATE managed."custom.aggregate" (managed.custom_type) OWNER TO deployer;
 CREATE AGGREGATE managed."row.count" (*) (SFUNC = int8inc, STYPE = bigint, INITCOND = '0');
 ALTER AGGREGATE managed."row.count" (*) OWNER TO deployer;
 `)
@@ -173,10 +185,21 @@ CREATE TABLE documents (id bigint PRIMARY KEY, title text);
 CREATE TABLE "audit.log" (id bigint PRIMARY KEY, title text);
 CREATE FUNCTION "calculate.dot"(value integer) RETURNS integer LANGUAGE sql AS 'SELECT value + 1';
 CREATE FUNCTION "calculate.dot"(value text) RETURNS text LANGUAGE sql AS 'SELECT value';
+CREATE TYPE custom_type AS ENUM ('one');
+CREATE FUNCTION "custom.arg"(value custom_type) RETURNS integer LANGUAGE sql AS 'SELECT 2';
+CREATE PROCEDURE "custom.proc"(value custom_type) LANGUAGE sql AS 'SELECT 1';
+COMMENT ON PROCEDURE "custom.proc"(custom_type) IS 'managed procedure';
+CREATE FUNCTION "custom.transition"(state bigint, value custom_type) RETURNS bigint LANGUAGE sql AS 'SELECT state + 1';
+CREATE AGGREGATE "custom.aggregate" (custom_type) (
+  SFUNC = "custom.transition", STYPE = bigint, INITCOND = '0'
+);
+COMMENT ON AGGREGATE "custom.aggregate" (custom_type) IS 'managed aggregate';
 CREATE AGGREGATE "row.count" (*) (SFUNC = int8inc, STYPE = bigint, INITCOND = '0');
 COMMENT ON AGGREGATE "row.count" (*) IS 'managed count';
 GRANT SELECT ON TABLE "audit.log" TO "app.reader";
 GRANT UPDATE (title) ON TABLE "audit.log" TO "column.reader";
+GRANT EXECUTE ON FUNCTION "custom.arg"(custom_type) TO "app.reader";
+REVOKE EXECUTE ON FUNCTION "custom.arg"(custom_type) FROM PUBLIC;
 ALTER DEFAULT PRIVILEGES FOR ROLE deployer IN SCHEMA managed GRANT SELECT ON TABLES TO "app.reader";
 `), 0o600))
 	globalFile := filepath.Join(dir, "global.toml")
@@ -233,6 +256,20 @@ SELECT EXISTS (
 	var calculated int
 	require.NoError(t, admin.QueryRowContext(ctx, `SELECT managed."calculate.dot"(1)`).Scan(&calculated))
 	require.Equal(t, 2, calculated)
+	require.NoError(t, admin.QueryRowContext(ctx, `SELECT managed."custom.arg"('one'::managed.custom_type)`).Scan(&calculated))
+	require.Equal(t, 2, calculated)
+	var canExecuteCustom bool
+	require.NoError(t, admin.QueryRowContext(ctx, `SELECT has_function_privilege('app.reader', 'managed."custom.arg"(managed.custom_type)', 'EXECUTE')`).Scan(&canExecuteCustom))
+	require.True(t, canExecuteCustom)
+	var publicCanExecuteCustom bool
+	require.NoError(t, admin.QueryRowContext(ctx, `SELECT has_function_privilege('public', 'managed."custom.arg"(managed.custom_type)', 'EXECUTE')`).Scan(&publicCanExecuteCustom))
+	require.False(t, publicCanExecuteCustom)
+	var procedureComment string
+	require.NoError(t, admin.QueryRowContext(ctx, `SELECT obj_description('managed."custom.proc"(managed.custom_type)'::regprocedure, 'pg_proc')`).Scan(&procedureComment))
+	require.Equal(t, "managed procedure", procedureComment)
+	var customAggregateComment string
+	require.NoError(t, admin.QueryRowContext(ctx, `SELECT obj_description('managed."custom.aggregate"(managed.custom_type)'::regprocedure, 'pg_proc')`).Scan(&customAggregateComment))
+	require.Equal(t, "managed aggregate", customAggregateComment)
 	var aggregateComment string
 	require.NoError(t, admin.QueryRowContext(ctx, `SELECT obj_description('managed."row.count"()'::regprocedure, 'pg_proc')`).Scan(&aggregateComment))
 	require.Equal(t, "managed count", aggregateComment)

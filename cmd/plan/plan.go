@@ -592,11 +592,26 @@ func inspectPlanStepOwner(ctx context.Context, db *sql.DB, step plan.Step, targe
 			JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
 			WHERE n.nspname = $1 AND t.typname = $2`, schema, identity.Name)
 	case diff.OwnerIdentityRoutine:
-		qualifiedIdentity := ir.QuoteIdentifier(schema) + "." + identity.Name
+		if identity.CatalogRoutineIdentity {
+			return inspectSinglePlanOwner(ctx, db, `
+				SELECT pg_get_userbyid(p.proowner)
+				FROM pg_catalog.pg_proc p
+				JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+				WHERE n.nspname = $1
+				  AND p.proname || '(' ||
+				      replace(replace(pg_catalog.pg_get_function_identity_arguments(p.oid),
+				          pg_catalog.quote_ident($1) || '.', ''), $1 || '.', '') || ')' = $2
+				  AND p.prokind = $3`, schema, identity.Name, identity.RoutineKind)
+		}
 		return inspectSinglePlanOwner(ctx, db, `
 			SELECT pg_get_userbyid(p.proowner)
 			FROM pg_catalog.pg_proc p
-			WHERE p.oid = pg_catalog.to_regprocedure($1) AND p.prokind = $2`, qualifiedIdentity, identity.RoutineKind)
+			JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+			WHERE n.nspname = $1
+			  AND p.proname = $2
+			  AND replace(replace(pg_catalog.oidvectortypes(p.proargtypes),
+			      pg_catalog.quote_ident($1) || '.', ''), $1 || '.', '') = $3
+			  AND p.prokind = $4`, schema, identity.Name, identity.Arguments, identity.RoutineKind)
 	case diff.OwnerIdentityDefaultPrivilege:
 		if identity.Role == "" {
 			return "", false, fmt.Errorf("cannot resolve default privilege owner from path %q", step.Path)

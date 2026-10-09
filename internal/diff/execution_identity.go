@@ -1,10 +1,6 @@
 package diff
 
-import (
-	"fmt"
-
-	"github.com/pgplex/pgschema/ir"
-)
+import "github.com/pgplex/pgschema/ir"
 
 type OwnerIdentityKind string
 
@@ -16,11 +12,13 @@ const (
 )
 
 type OwnerIdentity struct {
-	Kind        OwnerIdentityKind
-	Schema      string
-	Name        string
-	RoutineKind string
-	Role        string
+	Kind                   OwnerIdentityKind
+	Schema                 string
+	Name                   string
+	Arguments              string
+	RoutineKind            string
+	CatalogRoutineIdentity bool
+	Role                   string
 }
 
 func ExecutionOwnerIdentity(d Diff) OwnerIdentity {
@@ -127,8 +125,9 @@ func aggregateOwnerIdentity(aggregate *ir.Aggregate) OwnerIdentity {
 }
 
 func routineOwnerIdentity(schema, name, arguments, kind string) OwnerIdentity {
-	identity := fmt.Sprintf("%s(%s)", ir.QuoteIdentifier(name), arguments)
-	return OwnerIdentity{Kind: OwnerIdentityRoutine, Schema: schema, Name: identity, RoutineKind: kind}
+	return OwnerIdentity{
+		Kind: OwnerIdentityRoutine, Schema: schema, Name: name, Arguments: arguments, RoutineKind: kind,
+	}
 }
 
 func privilegeOwnerIdentity(privilege *ir.Privilege) OwnerIdentity {
@@ -139,9 +138,9 @@ func privilegeOwnerIdentity(privilege *ir.Privilege) OwnerIdentity {
 	case ir.PrivilegeObjectTypeTable, ir.PrivilegeObjectTypeView, ir.PrivilegeObjectTypeSequence:
 		return relationOwnerIdentity("", privilege.ObjectName)
 	case ir.PrivilegeObjectTypeFunction:
-		return OwnerIdentity{Kind: OwnerIdentityRoutine, Name: privilege.ObjectName, RoutineKind: "f"}
+		return OwnerIdentity{Kind: OwnerIdentityRoutine, Name: privilege.ObjectName, RoutineKind: "f", CatalogRoutineIdentity: true}
 	case ir.PrivilegeObjectTypeProcedure:
-		return OwnerIdentity{Kind: OwnerIdentityRoutine, Name: privilege.ObjectName, RoutineKind: "p"}
+		return OwnerIdentity{Kind: OwnerIdentityRoutine, Name: privilege.ObjectName, RoutineKind: "p", CatalogRoutineIdentity: true}
 	case ir.PrivilegeObjectTypeType:
 		return typeOwnerIdentity("", privilege.ObjectName)
 	default:
@@ -155,9 +154,9 @@ func revokedDefaultPrivilegeOwnerIdentity(privilege *ir.RevokedDefaultPrivilege)
 	}
 	switch privilege.ObjectType {
 	case ir.PrivilegeObjectTypeFunction:
-		return OwnerIdentity{Kind: OwnerIdentityRoutine, Name: privilege.ObjectName, RoutineKind: "f"}
+		return OwnerIdentity{Kind: OwnerIdentityRoutine, Name: privilege.ObjectName, RoutineKind: "f", CatalogRoutineIdentity: true}
 	case ir.PrivilegeObjectTypeProcedure:
-		return OwnerIdentity{Kind: OwnerIdentityRoutine, Name: privilege.ObjectName, RoutineKind: "p"}
+		return OwnerIdentity{Kind: OwnerIdentityRoutine, Name: privilege.ObjectName, RoutineKind: "p", CatalogRoutineIdentity: true}
 	case ir.PrivilegeObjectTypeType:
 		return typeOwnerIdentity("", privilege.ObjectName)
 	default:

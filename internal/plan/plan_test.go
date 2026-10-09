@@ -50,7 +50,7 @@ func TestReviewRoutineOwnerIdentityDoesNotChangePublicPath(t *testing.T) {
 	require.Len(t, groups[0].Steps, 1)
 	require.Equal(t, "audit.log.calculate.total", groups[0].Steps[0].Path)
 	require.Equal(t, diff.OwnerIdentity{
-		Kind: diff.OwnerIdentityRoutine, Schema: "audit.log", Name: `"calculate.total"(integer)`, RoutineKind: "f",
+		Kind: diff.OwnerIdentityRoutine, Schema: "audit.log", Name: "calculate.total", Arguments: "integer", RoutineKind: "f",
 	}, groups[0].Steps[0].OwnerIdentity)
 }
 
@@ -68,7 +68,28 @@ func TestReviewZeroArgumentAggregateUsesCatalogIdentity(t *testing.T) {
 	require.Len(t, groups, 1)
 	require.Len(t, groups[0].Steps, 1)
 	require.Equal(t, diff.OwnerIdentity{
-		Kind: diff.OwnerIdentityRoutine, Schema: "audit.log", Name: `"row.count"()`, RoutineKind: "a",
+		Kind: diff.OwnerIdentityRoutine, Schema: "audit.log", Name: "row.count", RoutineKind: "a",
+	}, groups[0].Steps[0].OwnerIdentity)
+}
+
+func TestReviewRoutinePrivilegeQuotesRawDottedName(t *testing.T) {
+	privilege := &ir.Privilege{
+		ObjectType: ir.PrivilegeObjectTypeFunction,
+		ObjectName: `calculate.dot(value "custom.type")`,
+	}
+	diffs := []diff.Diff{{
+		Statements: []diff.SQLStatement{{SQL: `GRANT EXECUTE ON FUNCTION "calculate.dot"("custom.type") TO reader;`}},
+		Type:       diff.DiffTypePrivilege,
+		Operation:  diff.DiffOperationCreate,
+		Path:       "privileges.FUNCTION.calculate.dot.reader",
+		Source:     privilege,
+	}}
+
+	groups := groupDiffs(diffs, 15, nil)
+	require.Len(t, groups, 1)
+	require.Len(t, groups[0].Steps, 1)
+	require.Equal(t, diff.OwnerIdentity{
+		Kind: diff.OwnerIdentityRoutine, Name: `calculate.dot(value "custom.type")`, RoutineKind: "f", CatalogRoutineIdentity: true,
 	}, groups[0].Steps[0].OwnerIdentity)
 }
 
