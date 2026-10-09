@@ -130,6 +130,125 @@ SELECT EXISTS (
 	require.False(t, replan.HasAnyChanges(), "replan must converge after applying the planned SET relationship and schema DDL:\n%s", replan.HumanColored(false))
 }
 
+func TestReviewMixedOwnerSchemaUsesAffectedObjectOwner(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	target := testutil.SetupPostgres(t)
+	defer target.Stop()
+	admin, host, port, database, _, _ := testutil.ConnectToPostgres(t, target)
+	defer admin.Close()
+	_, err := admin.ExecContext(ctx, `
+CREATE ROLE deployer LOGIN NOINHERIT CREATEROLE PASSWORD 'deployer-pass';
+CREATE ROLE app_owner;
+CREATE SCHEMA managed AUTHORIZATION app_owner;
+GRANT USAGE ON SCHEMA managed TO deployer;
+CREATE TABLE managed.documents (id bigint PRIMARY KEY);
+ALTER TABLE managed.documents OWNER TO deployer;
+`)
+	require.NoError(t, err)
+	majorVersion, err := detectPostgresMajorVersion(admin)
+	require.NoError(t, err)
+	grant := "GRANT app_owner TO deployer WITH ADMIN OPTION"
+	if majorVersion >= 16 {
+		grant = "GRANT app_owner TO deployer WITH ADMIN TRUE, INHERIT FALSE, SET TRUE"
+	}
+	_, err = admin.ExecContext(ctx, grant)
+	require.NoError(t, err)
+	dir := t.TempDir()
+	schemaFile := filepath.Join(dir, "schema.sql")
+	require.NoError(t, os.WriteFile(schemaFile, []byte("CREATE TABLE documents (id bigint PRIMARY KEY, title text);\n"), 0o600))
+	globalFile := filepath.Join(dir, "global.toml")
+	require.NoError(t, os.WriteFile(globalFile, []byte(`
+version = 1
+[[roles]]
+name = "app_owner"
+state = "external"
+[[roles]]
+name = "deployer"
+state = "external"
+[[ownership]]
+kind = "schema"
+name = "managed"
+owner = "app_owner"
+`), 0o600))
+	config := &planCmd.PlanConfig{
+		Host: host, Port: port, DB: database, User: "deployer", Password: "deployer-pass",
+		Schema: "managed", File: schemaFile, GlobalFile: globalFile,
+		ApplicationName: "pgschema-review-mixed-owner-test", SSLMode: "disable",
+	}
+	migrationPlan, err := planCmd.GeneratePlan(config, sharedEmbeddedPG)
+	require.NoError(t, err)
+	require.NoError(t, ApplyMigration(&ApplyConfig{
+		Host: host, Port: port, DB: database, User: "deployer", Password: "deployer-pass",
+		Schema: "managed", Plan: migrationPlan, AutoApprove: true, Quiet: true,
+		ApplicationName: "pgschema-review-mixed-owner-test", SSLMode: "disable",
+	}, nil))
+	var owner string
+	require.NoError(t, admin.QueryRowContext(ctx, `SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'managed.documents'::regclass`).Scan(&owner))
+	require.Equal(t, "deployer", owner)
+}
+
+func TestReviewRetiringSchemaOwnerCannotCreateBeforeDrop(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	target := testutil.SetupPostgres(t)
+	defer target.Stop()
+	admin, host, port, database, _, _ := testutil.ConnectToPostgres(t, target)
+	defer admin.Close()
+	_, err := admin.ExecContext(ctx, `
+CREATE ROLE deployer LOGIN NOINHERIT CREATEDB CREATEROLE PASSWORD 'deployer-pass';
+CREATE ROLE retiring CREATEDB;
+CREATE ROLE active CREATEDB;
+ALTER DATABASE testdb OWNER TO retiring;
+CREATE SCHEMA managed AUTHORIZATION retiring;
+`)
+	require.NoError(t, err)
+	majorVersion, err := detectPostgresMajorVersion(admin)
+	require.NoError(t, err)
+	grants := "GRANT retiring TO deployer WITH ADMIN OPTION; GRANT active TO deployer WITH ADMIN OPTION; GRANT active TO retiring"
+	if majorVersion >= 16 {
+		grants = "GRANT retiring TO deployer WITH ADMIN TRUE, INHERIT FALSE, SET TRUE; " +
+			"GRANT active TO deployer WITH ADMIN TRUE, INHERIT FALSE, SET TRUE; " +
+			"GRANT active TO retiring WITH ADMIN FALSE, INHERIT FALSE, SET TRUE"
+	}
+	_, err = admin.ExecContext(ctx, grants)
+	require.NoError(t, err)
+	dir := t.TempDir()
+	schemaFile := filepath.Join(dir, "schema.sql")
+	require.NoError(t, os.WriteFile(schemaFile, []byte("CREATE TABLE documents (id bigint PRIMARY KEY);\n"), 0o600))
+	globalFile := filepath.Join(dir, "global.toml")
+	require.NoError(t, os.WriteFile(globalFile, []byte(`
+version = 1
+[[roles]]
+name = "retiring"
+state = "absent"
+[[roles]]
+name = "active"
+state = "external"
+[[roles]]
+name = "deployer"
+state = "external"
+[[ownership]]
+kind = "database"
+name = "testdb"
+owner = "active"
+[[ownership]]
+kind = "schema"
+name = "managed"
+owner = "active"
+`), 0o600))
+	_, err = planCmd.GeneratePlan(&planCmd.PlanConfig{
+		Host: host, Port: port, DB: database, User: "deployer", Password: "deployer-pass",
+		Schema: "managed", File: schemaFile, GlobalFile: globalFile,
+		ApplicationName: "pgschema-review-retiring-owner-test", SSLMode: "disable",
+	}, sharedEmbeddedPG)
+	require.ErrorContains(t, err, `retiring schema execution role "retiring" would own newly created objects`)
+}
+
 func TestReviewOwnershipTransferUsesOldOwnerAuthority(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test")

@@ -2,6 +2,7 @@ package plan
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -441,10 +442,12 @@ func GeneratePlan(config *PlanConfig, provider postgres.DesiredStateProvider) (*
 		if err != nil {
 			return nil, fmt.Errorf("failed to plan global state: %w", err)
 		}
-		if err := globalstate.ValidateExecutionRole(*globalManifest, currentGlobalState, executionRole, targetMajorVersion); err != nil {
+		if err := validateRetiringExecutionRole(*globalManifest, migrationPlan, executionRole); err != nil {
 			return nil, fmt.Errorf("failed to plan schema execution role: %w", err)
 		}
-		migrationPlan.SetExecutionRole(executionRole)
+		if err := setSchemaExecutionRoles(ctx, targetDB, migrationPlan, *globalManifest, currentGlobalState, executionRole, targetMajorVersion); err != nil {
+			return nil, fmt.Errorf("failed to plan schema execution role: %w", err)
+		}
 		preSteps := make([]plan.Step, 0, len(globalChanges))
 		postChanges := make([]globalstate.Change, 0, len(globalChanges))
 		finalChanges := make([]globalstate.Change, 0, len(globalChanges))
@@ -484,6 +487,159 @@ func schemaExecutionRole(current globalstate.Snapshot, schema string) string {
 		return ""
 	}
 	return owner.Owner
+}
+
+func validateRetiringExecutionRole(manifest globalstate.Manifest, migrationPlan *plan.Plan, executionRole string) error {
+	if executionRole == "" {
+		return nil
+	}
+	retiring := false
+	for _, role := range manifest.Roles {
+		if role.Name == executionRole && role.State == globalstate.StateAbsent {
+			retiring = true
+			break
+		}
+	}
+	if !retiring {
+		return nil
+	}
+	for _, group := range migrationPlan.Groups {
+		for _, step := range group.Steps {
+			if createsOwnedObject(step) {
+				return fmt.Errorf("retiring schema execution role %q would own newly created objects", executionRole)
+			}
+		}
+	}
+	return nil
+}
+
+func setSchemaExecutionRoles(
+	ctx context.Context,
+	db *sql.DB,
+	migrationPlan *plan.Plan,
+	manifest globalstate.Manifest,
+	current globalstate.Snapshot,
+	defaultRole string,
+	majorVersion int,
+) error {
+	if current.SessionRole.Superuser {
+		return nil
+	}
+	for groupIndex := range migrationPlan.Groups {
+		group := &migrationPlan.Groups[groupIndex]
+		owners := make(map[string]struct{})
+		hasCreate := false
+		for _, step := range group.Steps {
+			if createsOwnedObject(step) {
+				hasCreate = true
+				continue
+			}
+			owner, found, err := inspectPlanStepOwner(ctx, db, step)
+			if err != nil {
+				return err
+			}
+			if found {
+				owners[owner] = struct{}{}
+			}
+		}
+		if len(owners) > 1 {
+			return fmt.Errorf("execution group %d changes objects with different owners", groupIndex+1)
+		}
+		role := defaultRole
+		for owner := range owners {
+			role = owner
+		}
+		if hasCreate && len(owners) == 1 && role != defaultRole {
+			return fmt.Errorf("execution group %d mixes new objects for schema owner %q with existing objects owned by %q", groupIndex+1, defaultRole, role)
+		}
+		if role == current.SessionRole.Name {
+			role = ""
+		}
+		if err := globalstate.ValidateExecutionRole(manifest, current, role, majorVersion); err != nil {
+			return err
+		}
+		group.ExecutionRole = role
+	}
+	return nil
+}
+
+func createsOwnedObject(step plan.Step) bool {
+	if step.Operation != "create" {
+		return false
+	}
+	switch step.Type {
+	case "table", "view", "materialized_view", "function", "procedure", "aggregate", "sequence", "type", "domain":
+		return true
+	default:
+		return false
+	}
+}
+
+func inspectPlanStepOwner(ctx context.Context, db *sql.DB, step plan.Step) (string, bool, error) {
+	objectType := step.Type
+	switch {
+	case objectType == "table" || strings.HasPrefix(objectType, "table."),
+		objectType == "view" || strings.HasPrefix(objectType, "view."),
+		objectType == "materialized_view" || strings.HasPrefix(objectType, "materialized_view."),
+		objectType == "sequence":
+		return inspectSinglePlanOwner(ctx, db, `
+SELECT DISTINCT pg_get_userbyid(c.relowner)
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname || '.' || c.relname = $1`, planRelationPath(step.Path))
+	case objectType == "type" || objectType == "domain":
+		return inspectSinglePlanOwner(ctx, db, `
+SELECT DISTINCT pg_get_userbyid(t.typowner)
+FROM pg_catalog.pg_type t
+JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+WHERE n.nspname || '.' || t.typname = $1`, planRelationPath(step.Path))
+	case objectType == "function" || objectType == "procedure" || objectType == "aggregate":
+		path := step.Path
+		if open := strings.IndexByte(path, '('); open >= 0 {
+			path = path[:open]
+		}
+		return inspectSinglePlanOwner(ctx, db, `
+SELECT DISTINCT pg_get_userbyid(p.proowner)
+FROM pg_catalog.pg_proc p
+JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname || '.' || p.proname = $1`, path)
+	default:
+		return "", false, nil
+	}
+}
+
+func planRelationPath(path string) string {
+	parts := strings.SplitN(path, ".", 3)
+	if len(parts) < 2 {
+		return path
+	}
+	return parts[0] + "." + parts[1]
+}
+
+func inspectSinglePlanOwner(ctx context.Context, db *sql.DB, query, path string) (string, bool, error) {
+	rows, err := db.QueryContext(ctx, query, path)
+	if err != nil {
+		return "", false, fmt.Errorf("inspect owner for planned object %q: %w", path, err)
+	}
+	defer rows.Close()
+	owners := make([]string, 0, 2)
+	for rows.Next() {
+		var owner string
+		if err := rows.Scan(&owner); err != nil {
+			return "", false, fmt.Errorf("scan owner for planned object %q: %w", path, err)
+		}
+		owners = append(owners, owner)
+	}
+	if err := rows.Err(); err != nil {
+		return "", false, fmt.Errorf("inspect owner for planned object %q: %w", path, err)
+	}
+	if len(owners) > 1 {
+		return "", false, fmt.Errorf("planned object %q resolves to multiple owners", path)
+	}
+	if len(owners) == 0 {
+		return "", false, nil
+	}
+	return owners[0], true, nil
 }
 
 func globalChangeDiff(change globalstate.Change) diff.Diff {

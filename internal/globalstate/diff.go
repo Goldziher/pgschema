@@ -134,12 +134,8 @@ func PlanChanges(manifest Manifest, current Snapshot, majorVersion int) ([]Chang
 						return nil, fmt.Errorf("membership %q is owned by foreign grantor %q and cannot be safely revoked", key.Path(), grantor)
 					}
 				}
-				if membership.Member == current.SessionRole.Name {
-					change.Phase = "final"
-					finalMembershipChanges = append(finalMembershipChanges, change)
-				} else {
-					changes = append(changes, change)
-				}
+				change.Phase = "final"
+				finalMembershipChanges = append(finalMembershipChanges, change)
 			}
 			continue
 		}
@@ -180,12 +176,8 @@ func PlanChanges(manifest Manifest, current Snapshot, majorVersion int) ([]Chang
 				Path:       key.Path(),
 				Membership: membershipRef(membership),
 			}
-			if membership.Member == current.SessionRole.Name {
-				change.Phase = "final"
-				finalMembershipChanges = append(finalMembershipChanges, change)
-			} else {
-				changes = append(changes, change)
-			}
+			change.Phase = "final"
+			finalMembershipChanges = append(finalMembershipChanges, change)
 			continue
 		}
 		change := Change{
@@ -195,7 +187,7 @@ func PlanChanges(manifest Manifest, current Snapshot, majorVersion int) ([]Chang
 			Path:       key.Path(),
 			Membership: membershipRef(membership),
 		}
-		if membership.Member == current.SessionRole.Name && membershipReducesAuthority(membership, actual, majorVersion) {
+		if membershipReducesAuthority(membership, actual, majorVersion) {
 			change.Phase = "final"
 			finalMembershipChanges = append(finalMembershipChanges, change)
 		} else {

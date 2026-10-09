@@ -292,6 +292,55 @@ func TestReviewMembershipWithAdminOptionDoesNotRequireCreateRole(t *testing.T) {
 	require.Equal(t, "role_membership", changes[0].Type)
 }
 
+func TestReviewMembershipAuthorityReductionRunsAfterOwnershipTransfer(t *testing.T) {
+	manifest := Manifest{
+		Version: 1,
+		Roles: []Role{
+			{Name: "deployer", State: StateExternal},
+			{Name: "old_owner", State: StateExternal},
+			{Name: "new_owner", State: StateExternal},
+		},
+		Memberships: []Membership{{Role: "new_owner", Member: "old_owner", State: StateAbsent, Inherit: true, Set: true}},
+		Ownership:   []Ownership{{Kind: "table", Name: "public.documents", Owner: "new_owner"}},
+	}
+	ref := ownershipKey("table", "public.documents")
+	current := Snapshot{
+		SessionRole:       RoleState{Name: "deployer"},
+		SessionAdminRoles: map[string]bool{"new_owner": true},
+		SessionSetRoles:   map[string]bool{"old_owner": true, "new_owner": true},
+		OwnerSetRoles:     map[RoleTransition]bool{{From: "old_owner", To: "new_owner"}: true},
+		Roles: map[string]RoleState{
+			"deployer":  {Name: "deployer"},
+			"old_owner": {Name: "old_owner"},
+			"new_owner": {Name: "new_owner"},
+		},
+		Memberships: map[MembershipRef]MembershipState{
+			MembershipKey("new_owner", "old_owner"): {
+				Role: "new_owner", Member: "old_owner", Inherit: true, Set: true,
+				Grantors: []string{"deployer"},
+			},
+		},
+		Ownership:                map[OwnershipRef]OwnershipState{ref: {Kind: "table", Name: "public.documents", Owner: "old_owner"}},
+		NewOwnerCreatePrivileges: map[OwnershipRef]bool{ref: true},
+	}
+
+	changes, err := PlanChanges(manifest, current, 18)
+	require.NoError(t, err)
+	require.Len(t, changes, 2)
+	require.Equal(t, "ownership", changes[0].Type)
+	require.Equal(t, "role_membership", changes[1].Type)
+	require.Equal(t, "final", changes[1].Phase)
+
+	manifest.Memberships[0].State = StatePresent
+	manifest.Memberships[0].Set = false
+	changes, err = PlanChanges(manifest, current, 18)
+	require.NoError(t, err)
+	require.Len(t, changes, 2)
+	require.Equal(t, "ownership", changes[0].Type)
+	require.Equal(t, "role_membership", changes[1].Type)
+	require.Equal(t, "final", changes[1].Phase)
+}
+
 func TestReviewRefusesDropRoleWithUnmanagedDependencies(t *testing.T) {
 	manifest := Manifest{Version: 1, Roles: []Role{{Name: "retired", State: StateAbsent}}}
 	current := Snapshot{
