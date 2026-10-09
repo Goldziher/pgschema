@@ -432,12 +432,7 @@ func GeneratePlan(config *PlanConfig, provider postgres.DesiredStateProvider) (*
 		if err != nil {
 			return nil, err
 		}
-		schemaOwnership := globalstate.OwnershipRef{Kind: "schema", Name: config.Schema}
-		executionRole := ""
-		if currentOwner, exists := currentGlobalState.Ownership[schemaOwnership]; exists &&
-			currentOwner.Owner != currentGlobalState.SessionRole.Name {
-			executionRole = currentOwner.Owner
-		}
+		executionRole := schemaExecutionRole(currentGlobalState, config.Schema)
 		globalFingerprint, err := globalstate.ComputeFingerprint(currentGlobalState, selection)
 		if err != nil {
 			return nil, err
@@ -481,6 +476,14 @@ func GeneratePlan(config *PlanConfig, provider postgres.DesiredStateProvider) (*
 	}
 
 	return migrationPlan, nil
+}
+
+func schemaExecutionRole(current globalstate.Snapshot, schema string) string {
+	owner, exists := current.Ownership[globalstate.OwnershipRef{Kind: "schema", Name: schema}]
+	if !exists || current.SessionRole.Superuser || owner.Owner == current.SessionRole.Name {
+		return ""
+	}
+	return owner.Owner
 }
 
 func globalChangeDiff(change globalstate.Change) diff.Diff {

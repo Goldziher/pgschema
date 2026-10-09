@@ -15,7 +15,18 @@ import (
 	"github.com/pgplex/pgschema/internal/postgres"
 	"github.com/pgplex/pgschema/ir"
 	"github.com/pgplex/pgschema/testutil"
+	"github.com/stretchr/testify/require"
 )
+
+func TestReviewToSQLRendersExecutionRole(t *testing.T) {
+	p := &Plan{Groups: []ExecutionGroup{{
+		ExecutionRole: "app_owner",
+		Steps:         []Step{{SQL: "CREATE INDEX CONCURRENTLY idx_documents ON documents (id);"}},
+	}}}
+
+	sql := p.ToSQL(SQLFormatRaw)
+	require.Equal(t, "SET ROLE app_owner;\nCREATE INDEX CONCURRENTLY idx_documents ON documents (id);\nRESET ROLE;\n", sql)
+}
 
 // sharedTestPostgres is the shared embedded postgres instance for all tests in this package
 var sharedTestPostgres *postgres.EmbeddedPostgres

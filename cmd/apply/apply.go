@@ -542,7 +542,15 @@ func executeGroup(ctx context.Context, conn *sql.DB, group plan.ExecutionGroup, 
 		}
 	}
 
-	if !hasDirectives {
+	hasConcurrent := false
+	for _, step := range group.Steps {
+		if containsConcurrentStatement([]string{step.SQL}) {
+			hasConcurrent = true
+			break
+		}
+	}
+
+	if !hasDirectives && !hasConcurrent {
 		// No directives - concatenate all SQL and execute in implicit transaction
 		return executeGroupConcatenated(ctx, conn, group, groupNum, quiet, retry)
 	} else {
@@ -599,21 +607,26 @@ func executeGroupConcatenated(ctx context.Context, conn *sql.DB, group plan.Exec
 
 // executeGroupIndividually executes statements individually without transactions
 func executeGroupIndividually(ctx context.Context, conn *sql.DB, group plan.ExecutionGroup, groupNum int, quiet bool) error {
+	pinned, err := conn.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to pin connection for group %d: %w", groupNum, err)
+	}
+	defer pinned.Close()
 	if group.ExecutionRole != "" {
-		if _, err := util.ExecContextWithLogging(ctx, conn, "SET ROLE "+ir.QuoteIdentifier(group.ExecutionRole), "set group execution role"); err != nil {
+		if _, err := util.ExecContextWithLogging(ctx, pinned, "SET ROLE "+ir.QuoteIdentifier(group.ExecutionRole), "set group execution role"); err != nil {
 			return fmt.Errorf("failed to set execution role for group %d: %w", groupNum, err)
 		}
 	}
-	groupErr := executeGroupStepsIndividually(ctx, conn, group, groupNum, quiet)
+	groupErr := executeGroupStepsIndividually(ctx, pinned, group, groupNum, quiet)
 	if group.ExecutionRole != "" {
-		if _, err := util.ExecContextWithLogging(ctx, conn, "RESET ROLE", "reset group execution role"); err != nil && groupErr == nil {
+		if _, err := util.ExecContextWithLogging(ctx, pinned, "RESET ROLE", "reset group execution role"); err != nil && groupErr == nil {
 			return fmt.Errorf("failed to reset execution role for group %d: %w", groupNum, err)
 		}
 	}
 	return groupErr
 }
 
-func executeGroupStepsIndividually(ctx context.Context, conn *sql.DB, group plan.ExecutionGroup, groupNum int, quiet bool) error {
+func executeGroupStepsIndividually(ctx context.Context, conn directiveExecer, group plan.ExecutionGroup, groupNum int, quiet bool) error {
 	for stepIdx, step := range group.Steps {
 		if step.Directive != nil {
 			// Handle directive execution

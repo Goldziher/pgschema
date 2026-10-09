@@ -47,6 +47,7 @@ type Snapshot struct {
 	NewOwnerCreatePrivileges          map[OwnershipRef]bool
 	OwnershipExecutorCreatePrivileges map[OwnershipRef]bool
 	CurrentOwnerDatabaseAuthority     map[OwnershipRef]bool
+	RoleDependencyCounts              map[string]int
 	DatabaseName                      string
 }
 
@@ -141,6 +142,7 @@ func Inspect(ctx context.Context, db *sql.DB, selection Selection, majorVersion 
 		NewOwnerCreatePrivileges:          make(map[OwnershipRef]bool),
 		OwnershipExecutorCreatePrivileges: make(map[OwnershipRef]bool),
 		CurrentOwnerDatabaseAuthority:     make(map[OwnershipRef]bool),
+		RoleDependencyCounts:              make(map[string]int),
 	}
 	var sessionConfig pq.StringArray
 	if err := db.QueryRowContext(ctx, `
@@ -229,6 +231,29 @@ ORDER BY rolname`, pq.Array(selection.Roles))
 		}
 		if err := rows.Err(); err != nil {
 			return Snapshot{}, fmt.Errorf("inspect global roles: %w", err)
+		}
+		dependencyRows, err := db.QueryContext(ctx, `
+SELECT r.rolname, (
+  SELECT count(*) FROM pg_catalog.pg_shdepend d
+  WHERE d.refclassid = 'pg_authid'::regclass AND d.refobjid = r.oid
+    AND d.deptype <> 'p'
+)
+FROM pg_catalog.pg_roles r
+WHERE r.rolname = ANY($1)`, pq.Array(selection.Roles))
+		if err != nil {
+			return Snapshot{}, fmt.Errorf("inspect global role dependencies: %w", err)
+		}
+		for dependencyRows.Next() {
+			var role string
+			var count int
+			if err := dependencyRows.Scan(&role, &count); err != nil {
+				dependencyRows.Close()
+				return Snapshot{}, fmt.Errorf("scan global role dependencies: %w", err)
+			}
+			snapshot.RoleDependencyCounts[role] = count
+		}
+		if err := dependencyRows.Close(); err != nil {
+			return Snapshot{}, fmt.Errorf("inspect global role dependencies: %w", err)
 		}
 	}
 
@@ -358,6 +383,7 @@ func ComputeFingerprint(snapshot Snapshot, selection Selection) (*Fingerprint, e
 		OwnerCreate       []bool                   `json:"owner_create"`
 		ExecutorCreate    []bool                   `json:"executor_create"`
 		OwnerDatabase     []bool                   `json:"owner_database"`
+		RoleDependencies  []int                    `json:"role_dependencies"`
 	}
 	authority := authorityState{
 		Name: snapshot.SessionRole.Name, Superuser: snapshot.SessionRole.Superuser,
@@ -416,6 +442,7 @@ func ComputeFingerprint(snapshot Snapshot, selection Selection) (*Fingerprint, e
 		}
 	}
 	for _, name := range selection.Roles {
+		state.RoleDependencies = append(state.RoleDependencies, snapshot.RoleDependencyCounts[name])
 		if role, exists := snapshot.Roles[name]; exists {
 			roleCopy := role
 			state.Roles = append(state.Roles, &roleCopy)
@@ -609,7 +636,7 @@ func ownershipQuery(object Ownership) (string, []any, error) {
 		if object.Kind == "procedure" {
 			kind = "p"
 		}
-		return `SELECT pg_get_userbyid(p.proowner), EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e') FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' = $1 AND p.prokind = $2`, []any{object.Name, kind}, nil
+		return `SELECT pg_get_userbyid(p.proowner), EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e') FROM pg_catalog.pg_proc p WHERE p.oid = pg_catalog.to_regprocedure($1) AND p.prokind = $2`, []any{object.Name, kind}, nil
 	default:
 		return "", nil, fmt.Errorf("unsupported ownership kind %q", object.Kind)
 	}

@@ -381,6 +381,12 @@ func (p *Plan) ToSQL(format SQLFormat) string {
 			sqlOutput.WriteString(fmt.Sprintf("-- Transaction Group #%d\n", groupIdx+1))
 		}
 
+		if group.ExecutionRole != "" {
+			sqlOutput.WriteString("SET ROLE ")
+			sqlOutput.WriteString(ir.QuoteIdentifier(group.ExecutionRole))
+			sqlOutput.WriteString(";\n")
+		}
+
 		for stepIdx, step := range group.Steps {
 			if step.Directive != nil {
 				// Handle directive statements
@@ -397,6 +403,9 @@ func (p *Plan) ToSQL(format SQLFormat) string {
 			if stepIdx < len(group.Steps)-1 || groupIdx < len(p.Groups)-1 {
 				sqlOutput.WriteString("\n")
 			}
+		}
+		if group.ExecutionRole != "" {
+			sqlOutput.WriteString("RESET ROLE;\n")
 		}
 	}
 

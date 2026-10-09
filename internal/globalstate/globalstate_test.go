@@ -255,10 +255,10 @@ func TestPlanChangesConvergesRoleLifecycleOwnershipAndGlobalDefaults(t *testing.
 	changes, err := PlanChanges(manifest, current, 18)
 	require.NoError(t, err)
 	require.Equal(t, `ALTER ROLE app_owner WITH NOSUPERUSER NOLOGIN INHERIT NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1 VALID UNTIL E'2030-01-02T03:04:05Z'; ALTER ROLE app_owner RESET ALL; ALTER ROLE app_owner SET statement_timeout TO E'5s'`, changes[0].SQL)
-	require.Equal(t, "post", changes[1].Phase)
-	require.Equal(t, `DROP ROLE retired_role`, changes[1].SQL)
-	require.Equal(t, `ALTER TABLE public.documents OWNER TO app_owner`, changes[2].SQL)
-	require.Equal(t, `ALTER DEFAULT PRIVILEGES FOR ROLE app_owner REVOKE ALL ON TABLES FROM app_reader; ALTER DEFAULT PRIVILEGES FOR ROLE app_owner GRANT SELECT ON TABLES TO app_reader`, changes[3].SQL)
+	require.Equal(t, `ALTER TABLE public.documents OWNER TO app_owner`, changes[1].SQL)
+	require.Equal(t, `ALTER DEFAULT PRIVILEGES FOR ROLE app_owner REVOKE ALL ON TABLES FROM app_reader; ALTER DEFAULT PRIVILEGES FOR ROLE app_owner GRANT SELECT ON TABLES TO app_reader`, changes[2].SQL)
+	require.Equal(t, "final", changes[3].Phase)
+	require.Equal(t, `DROP ROLE retired_role`, changes[3].SQL)
 }
 
 func TestPlanChangesRejectsRoleMutationWithoutAuthority(t *testing.T) {

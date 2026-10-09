@@ -239,6 +239,93 @@ func TestReviewSuperuserLossRunsAfterDependentChanges(t *testing.T) {
 	require.Equal(t, "final", changes[1].Phase)
 }
 
+func TestReviewNonSessionAuthorityReductionRunsAfterOwnershipTransfer(t *testing.T) {
+	manifest := Manifest{
+		Version: 1,
+		Roles: []Role{
+			{Name: "deployer", State: StateExternal},
+			{Name: "old_owner", State: StatePresent, Inherit: true, ConnectionLimit: -1},
+			{Name: "new_owner", State: StateExternal},
+		},
+		Ownership: []Ownership{{Kind: "database", Name: "app", Owner: "new_owner"}},
+	}
+	ref := ownershipKey("database", "app")
+	current := Snapshot{
+		SessionRole:       RoleState{Name: "deployer", CreateRole: true, CreateDB: true},
+		SessionAdminRoles: map[string]bool{"old_owner": true},
+		SessionSetRoles:   map[string]bool{"old_owner": true, "new_owner": true},
+		OwnerSetRoles:     map[RoleTransition]bool{{From: "old_owner", To: "new_owner"}: true},
+		Roles: map[string]RoleState{
+			"deployer":  {Name: "deployer", CreateRole: true, CreateDB: true},
+			"old_owner": {Name: "old_owner", CreateDB: true, Inherit: true, ConnectionLimit: -1, ValidUntil: "infinity"},
+			"new_owner": {Name: "new_owner", CreateDB: true},
+		},
+		Ownership:                     map[OwnershipRef]OwnershipState{ref: {Kind: "database", Name: "app", Owner: "old_owner"}},
+		NewOwnerCreatePrivileges:      map[OwnershipRef]bool{ref: true},
+		CurrentOwnerDatabaseAuthority: map[OwnershipRef]bool{ref: true},
+	}
+
+	changes, err := PlanChanges(manifest, current, 18)
+	require.NoError(t, err)
+	require.Len(t, changes, 2)
+	require.Equal(t, "ownership", changes[0].Type)
+	require.Equal(t, "role", changes[1].Type)
+	require.Equal(t, "final", changes[1].Phase)
+}
+
+func TestReviewMembershipWithAdminOptionDoesNotRequireCreateRole(t *testing.T) {
+	manifest := Manifest{
+		Version:     1,
+		Roles:       []Role{{Name: "app_group", State: StateExternal}, {Name: "app_login", State: StateExternal}},
+		Memberships: []Membership{{Role: "app_group", Member: "app_login", State: StatePresent, Inherit: true, Set: true}},
+	}
+	current := Snapshot{
+		SessionRole:       RoleState{Name: "deployer"},
+		SessionAdminRoles: map[string]bool{"app_group": true},
+		Roles:             map[string]RoleState{"app_group": {Name: "app_group"}, "app_login": {Name: "app_login"}},
+		Memberships:       map[MembershipRef]MembershipState{},
+	}
+
+	changes, err := PlanChanges(manifest, current, 18)
+	require.NoError(t, err)
+	require.Len(t, changes, 1)
+	require.Equal(t, "role_membership", changes[0].Type)
+}
+
+func TestReviewRefusesDropRoleWithUnmanagedDependencies(t *testing.T) {
+	manifest := Manifest{Version: 1, Roles: []Role{{Name: "retired", State: StateAbsent}}}
+	current := Snapshot{
+		SessionRole:          RoleState{Name: "deployer", CreateRole: true},
+		SessionAdminRoles:    map[string]bool{"retired": true},
+		Roles:                map[string]RoleState{"retired": {Name: "retired"}},
+		RoleDependencyCounts: map[string]int{"retired": 1},
+	}
+
+	_, err := PlanChanges(manifest, current, 18)
+	require.ErrorContains(t, err, `role "retired" still owns objects or holds privileges outside the managed selection`)
+}
+
+func TestReviewAllowsDropRoleAfterManagedOwnershipRelease(t *testing.T) {
+	manifest := Manifest{
+		Version:   1,
+		Roles:     []Role{{Name: "retired", State: StateAbsent}, {Name: "active", State: StateExternal}},
+		Ownership: []Ownership{{Kind: "table", Name: "public.documents", Owner: "active"}},
+	}
+	ref := ownershipKey("table", "public.documents")
+	current := Snapshot{
+		SessionRole:          RoleState{Name: "postgres", Superuser: true},
+		Roles:                map[string]RoleState{"retired": {Name: "retired"}, "active": {Name: "active"}},
+		Ownership:            map[OwnershipRef]OwnershipState{ref: {Kind: "table", Name: "public.documents", Owner: "retired"}},
+		RoleDependencyCounts: map[string]int{"retired": 1},
+	}
+
+	changes, err := PlanChanges(manifest, current, 18)
+	require.NoError(t, err)
+	require.Len(t, changes, 2)
+	require.Equal(t, "ownership", changes[0].Type)
+	require.Equal(t, "role", changes[1].Type)
+}
+
 func TestReviewRejectsForeignGrantorAuthorityReduction(t *testing.T) {
 	manifest := Manifest{
 		Version: 1,

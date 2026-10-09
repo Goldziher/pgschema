@@ -59,9 +59,12 @@ func PlanChanges(manifest Manifest, current Snapshot, majorVersion int) ([]Chang
 			if role.Name == current.SessionRole.Name || strings.HasPrefix(role.Name, "pg_") {
 				return nil, fmt.Errorf("refusing to drop protected role %q", role.Name)
 			}
-			changes = append(changes, Change{
+			if current.RoleDependencyCounts[role.Name] > plannedOwnershipReleases(manifest, current, role.Name) {
+				return nil, fmt.Errorf("role %q still owns objects or holds privileges outside the managed selection", role.Name)
+			}
+			finalRoleChanges = append(finalRoleChanges, Change{
 				SQL: "DROP ROLE " + ir.QuoteIdentifier(role.Name), Type: "role", Operation: "drop",
-				Path: role.Name, Phase: "post", RoleName: role.Name,
+				Path: role.Name, Phase: "final", RoleName: role.Name,
 			})
 			continue
 		}
@@ -93,7 +96,7 @@ func PlanChanges(manifest Manifest, current Snapshot, majorVersion int) ([]Chang
 				Path:      role.Name,
 				RoleName:  role.Name,
 			}
-			if role.Name == current.SessionRole.Name && roleReducesAuthority(role, actual) {
+			if roleReducesAuthority(role, actual) {
 				change.Phase = "final"
 				finalRoleChanges = append(finalRoleChanges, change)
 			} else {
@@ -251,6 +254,17 @@ func PlanChanges(manifest Manifest, current Snapshot, majorVersion int) ([]Chang
 	return changes, nil
 }
 
+func plannedOwnershipReleases(manifest Manifest, current Snapshot, owner string) int {
+	releases := 0
+	for _, object := range manifest.Ownership {
+		actual, exists := current.Ownership[ownershipKey(object.Kind, object.Name)]
+		if exists && actual.Owner == owner && object.Owner != owner {
+			releases++
+		}
+	}
+	return releases
+}
+
 func preflightRoleAuthority(manifest Manifest, current Snapshot, changes []Change, majorVersion int) error {
 	if current.SessionRole.Name == "" || current.SessionRole.Superuser {
 		return nil
@@ -271,7 +285,7 @@ func preflightRoleAuthority(manifest Manifest, current Snapshot, changes []Chang
 	}
 	for _, change := range changes {
 		switch change.Type {
-		case "role", "role_membership":
+		case "role":
 			if !current.SessionRole.CreateRole {
 				return fmt.Errorf("session role %q lacks CREATEROLE required by the planned role changes", current.SessionRole.Name)
 			}
@@ -279,11 +293,14 @@ func preflightRoleAuthority(manifest Manifest, current Snapshot, changes []Chang
 				continue
 			}
 			authorityRole := change.RoleName
-			if change.Type == "role_membership" {
-				authorityRole = change.Membership.Role
-			} else if change.Operation == "create" {
+			if change.Operation == "create" {
 				continue
 			}
+			if !created[authorityRole] && !current.SessionAdminRoles[authorityRole] {
+				return fmt.Errorf("session role %q lacks ADMIN OPTION on role %q required by the planned %s", current.SessionRole.Name, authorityRole, change.Type)
+			}
+		case "role_membership":
+			authorityRole := change.Membership.Role
 			if !created[authorityRole] && !current.SessionAdminRoles[authorityRole] {
 				return fmt.Errorf("session role %q lacks ADMIN OPTION on role %q required by the planned %s", current.SessionRole.Name, authorityRole, change.Type)
 			}
