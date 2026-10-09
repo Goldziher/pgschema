@@ -43,3 +43,44 @@ Added opt-in role, membership, ownership, role lifecycle, and global default pri
 ### Next Steps
 
 - None - task complete
+
+## Session 2: Harden global state authority planning
+
+**Date**: 2026-10-09
+**Task**: Harden global state authority planning
+
+### Summary
+
+Fixed eight reviewed authority, membership, ownership, literal, validation, and composite-key defects with PostgreSQL 15-18 regression coverage.
+
+### Main Changes
+
+- Made global-state plan keys collision-free and carried structured role, membership,
+  ownership, and default-privilege subjects through planning and authority lookup.
+- Enforced safe PostgreSQL authority ordering, old-owner execution context, and
+  deterministic rejection of unsupported multi-grantor membership mutations.
+- Added manifest validation for duplicate privileges and references to absent roles,
+  plus literal quoting independent of `standard_conforming_strings`.
+- Reworked catalog inspection so plan-only schema inspection remains read-only while
+  preserving type modifiers, identity values, and existing fingerprint semantics.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `b2032e3` | (see git log) |
+
+### Testing
+
+- [OK] `go test -count=1 -timeout 20m ./...`
+- [OK] `go test -short -count=1 -timeout 20m ./...`
+- [OK] `go vet ./...`
+- [OK] Focused global-state integration tests on PostgreSQL 15, 16, 17, and 18
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
