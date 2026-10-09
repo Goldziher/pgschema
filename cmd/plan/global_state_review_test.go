@@ -25,8 +25,28 @@ func TestReviewSuperuserDoesNotAssumeAffectedObjectOwner(t *testing.T) {
 	}}}}}
 	current := globalstate.Snapshot{SessionRole: globalstate.RoleState{Name: "postgres", Superuser: true}}
 
-	require.NoError(t, setSchemaExecutionRoles(context.Background(), nil, p, globalstate.Manifest{}, current, "", 18))
+	require.NoError(t, setSchemaExecutionRoles(context.Background(), nil, p, globalstate.Manifest{}, current, "", "managed", 18))
 	require.Empty(t, p.Groups[0].ExecutionRole)
+}
+
+func TestReviewDefaultPrivilegeUsesDeclaredOwner(t *testing.T) {
+	p := &internalplan.Plan{Groups: []internalplan.ExecutionGroup{{Steps: []internalplan.Step{{
+		Type: "default_privilege", Operation: "create", Path: "default_privileges.deployer.TABLES.app_reader",
+	}}}}}
+	current := globalstate.Snapshot{SessionRole: globalstate.RoleState{Name: "deployer"}}
+
+	require.NoError(t, setSchemaExecutionRoles(context.Background(), nil, p, globalstate.Manifest{}, current, "app_owner", "managed", 18))
+	require.Empty(t, p.Groups[0].ExecutionRole)
+}
+
+func TestReviewGenericCommentFailsBeforeMutation(t *testing.T) {
+	p := &internalplan.Plan{Groups: []internalplan.ExecutionGroup{{Steps: []internalplan.Step{{
+		Type: "comment", Operation: "alter", Path: "opaque",
+	}}}}}
+	current := globalstate.Snapshot{SessionRole: globalstate.RoleState{Name: "deployer"}}
+
+	err := setSchemaExecutionRoles(context.Background(), nil, p, globalstate.Manifest{}, current, "app_owner", "managed", 18)
+	require.ErrorContains(t, err, `cannot safely resolve execution owner for generic comment "opaque"`)
 }
 
 func TestReviewRetiringExecutionRoleCannotOwnCreatedObjects(t *testing.T) {

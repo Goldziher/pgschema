@@ -445,7 +445,7 @@ func GeneratePlan(config *PlanConfig, provider postgres.DesiredStateProvider) (*
 		if err := validateRetiringExecutionRole(*globalManifest, migrationPlan, executionRole); err != nil {
 			return nil, fmt.Errorf("failed to plan schema execution role: %w", err)
 		}
-		if err := setSchemaExecutionRoles(ctx, targetDB, migrationPlan, *globalManifest, currentGlobalState, executionRole, targetMajorVersion); err != nil {
+		if err := setSchemaExecutionRoles(ctx, targetDB, migrationPlan, *globalManifest, currentGlobalState, executionRole, config.Schema, targetMajorVersion); err != nil {
 			return nil, fmt.Errorf("failed to plan schema execution role: %w", err)
 		}
 		preSteps := make([]plan.Step, 0, len(globalChanges))
@@ -520,6 +520,7 @@ func setSchemaExecutionRoles(
 	manifest globalstate.Manifest,
 	current globalstate.Snapshot,
 	defaultRole string,
+	targetSchema string,
 	majorVersion int,
 ) error {
 	if current.SessionRole.Superuser {
@@ -534,7 +535,7 @@ func setSchemaExecutionRoles(
 				hasCreate = true
 				continue
 			}
-			owner, found, err := inspectPlanStepOwner(ctx, db, step)
+			owner, found, err := inspectPlanStepOwner(ctx, db, step, targetSchema)
 			if err != nil {
 				return err
 			}
@@ -575,7 +576,7 @@ func createsOwnedObject(step plan.Step) bool {
 	}
 }
 
-func inspectPlanStepOwner(ctx context.Context, db *sql.DB, step plan.Step) (string, bool, error) {
+func inspectPlanStepOwner(ctx context.Context, db *sql.DB, step plan.Step, targetSchema string) (string, bool, error) {
 	objectType := step.Type
 	switch {
 	case objectType == "table" || strings.HasPrefix(objectType, "table."),
@@ -594,18 +595,86 @@ FROM pg_catalog.pg_type t
 JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
 WHERE n.nspname || '.' || t.typname = $1`, planRelationPath(step.Path))
 	case objectType == "function" || objectType == "procedure" || objectType == "aggregate":
-		path := step.Path
-		if open := strings.IndexByte(path, '('); open >= 0 {
-			path = path[:open]
+		if step.ExecutionIdentity == "" {
+			return "", false, fmt.Errorf("cannot resolve routine owner from path %q without an exact identity", step.Path)
+		}
+		kind := "f"
+		if objectType == "procedure" {
+			kind = "p"
+		} else if objectType == "aggregate" {
+			kind = "a"
 		}
 		return inspectSinglePlanOwner(ctx, db, `
-SELECT DISTINCT pg_get_userbyid(p.proowner)
-FROM pg_catalog.pg_proc p
-JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-WHERE n.nspname || '.' || p.proname = $1`, path)
+			SELECT pg_get_userbyid(p.proowner)
+			FROM pg_catalog.pg_proc p
+			WHERE p.oid = pg_catalog.to_regprocedure($1) AND p.prokind = $2`, step.ExecutionIdentity, kind)
+	case objectType == "privilege":
+		return inspectPrivilegeStepOwner(ctx, db, step.Path, targetSchema, true)
+	case objectType == "revoked_default_privilege":
+		return inspectPrivilegeStepOwner(ctx, db, step.Path, targetSchema, false)
+	case objectType == "column_privilege":
+		parts := strings.Split(step.Path, ".")
+		if len(parts) < 5 {
+			return "", false, fmt.Errorf("cannot resolve column privilege owner from path %q", step.Path)
+		}
+		return inspectRelationOwner(ctx, db, targetSchema, parts[2])
+	case objectType == "default_privilege":
+		parts := strings.Split(step.Path, ".")
+		if len(parts) < 4 || parts[1] == "" {
+			return "", false, fmt.Errorf("cannot resolve default privilege owner from path %q", step.Path)
+		}
+		return parts[1], true, nil
+	case objectType == "comment":
+		return "", false, fmt.Errorf("cannot safely resolve execution owner for generic comment %q", step.Path)
 	default:
 		return "", false, nil
 	}
+}
+
+func inspectPrivilegeStepOwner(ctx context.Context, db *sql.DB, path, targetSchema string, hasGrantee bool) (string, bool, error) {
+	parts := strings.Split(path, ".")
+	minimum := 3
+	if hasGrantee {
+		minimum = 4
+	}
+	if len(parts) < minimum {
+		return "", false, fmt.Errorf("cannot resolve privilege owner from path %q", path)
+	}
+	objectType := parts[1]
+	end := len(parts)
+	if hasGrantee {
+		end--
+	}
+	objectName := strings.Join(parts[2:end], ".")
+	switch objectType {
+	case "TABLE", "VIEW", "SEQUENCE":
+		return inspectRelationOwner(ctx, db, targetSchema, objectName)
+	case "FUNCTION", "PROCEDURE":
+		kind := "f"
+		if objectType == "PROCEDURE" {
+			kind = "p"
+		}
+		return inspectSinglePlanOwner(ctx, db, `
+			SELECT pg_get_userbyid(p.proowner)
+			FROM pg_catalog.pg_proc p
+			WHERE p.oid = pg_catalog.to_regprocedure($1) AND p.prokind = $2`, targetSchema+"."+objectName, kind)
+	case "TYPE":
+		return inspectSinglePlanOwner(ctx, db, `
+			SELECT pg_get_userbyid(t.typowner)
+			FROM pg_catalog.pg_type t
+			JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+			WHERE n.nspname = $1 AND t.typname = $2`, targetSchema, objectName)
+	default:
+		return "", false, fmt.Errorf("cannot resolve owner for privilege object type %q", objectType)
+	}
+}
+
+func inspectRelationOwner(ctx context.Context, db *sql.DB, schema, name string) (string, bool, error) {
+	return inspectSinglePlanOwner(ctx, db, `
+		SELECT pg_get_userbyid(c.relowner)
+		FROM pg_catalog.pg_class c
+		JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = $2`, schema, name)
 }
 
 func planRelationPath(path string) string {
@@ -616,25 +685,25 @@ func planRelationPath(path string) string {
 	return parts[0] + "." + parts[1]
 }
 
-func inspectSinglePlanOwner(ctx context.Context, db *sql.DB, query, path string) (string, bool, error) {
-	rows, err := db.QueryContext(ctx, query, path)
+func inspectSinglePlanOwner(ctx context.Context, db *sql.DB, query string, args ...any) (string, bool, error) {
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return "", false, fmt.Errorf("inspect owner for planned object %q: %w", path, err)
+		return "", false, fmt.Errorf("inspect owner for planned object: %w", err)
 	}
 	defer rows.Close()
 	owners := make([]string, 0, 2)
 	for rows.Next() {
 		var owner string
 		if err := rows.Scan(&owner); err != nil {
-			return "", false, fmt.Errorf("scan owner for planned object %q: %w", path, err)
+			return "", false, fmt.Errorf("scan owner for planned object: %w", err)
 		}
 		owners = append(owners, owner)
 	}
 	if err := rows.Err(); err != nil {
-		return "", false, fmt.Errorf("inspect owner for planned object %q: %w", path, err)
+		return "", false, fmt.Errorf("inspect owner for planned object: %w", err)
 	}
 	if len(owners) > 1 {
-		return "", false, fmt.Errorf("planned object %q resolves to multiple owners", path)
+		return "", false, fmt.Errorf("planned object resolves to multiple owners")
 	}
 	if len(owners) == 0 {
 		return "", false, nil

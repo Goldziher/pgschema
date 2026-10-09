@@ -142,10 +142,16 @@ func TestReviewMixedOwnerSchemaUsesAffectedObjectOwner(t *testing.T) {
 	_, err := admin.ExecContext(ctx, `
 CREATE ROLE deployer LOGIN NOINHERIT CREATEROLE PASSWORD 'deployer-pass';
 CREATE ROLE app_owner;
+CREATE ROLE app_reader;
+CREATE ROLE column_reader;
 CREATE SCHEMA managed AUTHORIZATION app_owner;
-GRANT USAGE ON SCHEMA managed TO deployer;
+GRANT USAGE, CREATE ON SCHEMA managed TO deployer;
 CREATE TABLE managed.documents (id bigint PRIMARY KEY);
 ALTER TABLE managed.documents OWNER TO deployer;
+CREATE FUNCTION managed.calculate(value integer) RETURNS integer LANGUAGE sql AS 'SELECT value';
+ALTER FUNCTION managed.calculate(integer) OWNER TO deployer;
+CREATE FUNCTION managed.calculate(value text) RETURNS text LANGUAGE sql AS 'SELECT value';
+ALTER FUNCTION managed.calculate(text) OWNER TO app_owner;
 `)
 	require.NoError(t, err)
 	majorVersion, err := detectPostgresMajorVersion(admin)
@@ -158,7 +164,14 @@ ALTER TABLE managed.documents OWNER TO deployer;
 	require.NoError(t, err)
 	dir := t.TempDir()
 	schemaFile := filepath.Join(dir, "schema.sql")
-	require.NoError(t, os.WriteFile(schemaFile, []byte("CREATE TABLE documents (id bigint PRIMARY KEY, title text);\n"), 0o600))
+	require.NoError(t, os.WriteFile(schemaFile, []byte(`
+CREATE TABLE documents (id bigint PRIMARY KEY, title text);
+CREATE FUNCTION calculate(value integer) RETURNS integer LANGUAGE sql AS 'SELECT value + 1';
+CREATE FUNCTION calculate(value text) RETURNS text LANGUAGE sql AS 'SELECT value';
+GRANT SELECT ON TABLE documents TO app_reader;
+GRANT UPDATE (title) ON TABLE documents TO column_reader;
+ALTER DEFAULT PRIVILEGES FOR ROLE deployer IN SCHEMA managed GRANT SELECT ON TABLES TO app_reader;
+`), 0o600))
 	globalFile := filepath.Join(dir, "global.toml")
 	require.NoError(t, os.WriteFile(globalFile, []byte(`
 version = 1
@@ -167,6 +180,12 @@ name = "app_owner"
 state = "external"
 [[roles]]
 name = "deployer"
+state = "external"
+[[roles]]
+name = "app_reader"
+state = "external"
+[[roles]]
+name = "column_reader"
 state = "external"
 [[ownership]]
 kind = "schema"
@@ -188,6 +207,25 @@ owner = "app_owner"
 	var owner string
 	require.NoError(t, admin.QueryRowContext(ctx, `SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'managed.documents'::regclass`).Scan(&owner))
 	require.Equal(t, "deployer", owner)
+	var canSelect bool
+	require.NoError(t, admin.QueryRowContext(ctx, `SELECT has_table_privilege('app_reader', 'managed.documents', 'SELECT')`).Scan(&canSelect))
+	require.True(t, canSelect)
+	var canUpdateTitle bool
+	require.NoError(t, admin.QueryRowContext(ctx, `SELECT has_column_privilege('column_reader', 'managed.documents', 'title', 'UPDATE')`).Scan(&canUpdateTitle))
+	require.True(t, canUpdateTitle)
+	var hasDefaultSelect bool
+	require.NoError(t, admin.QueryRowContext(ctx, `
+SELECT EXISTS (
+  SELECT 1 FROM pg_default_acl d CROSS JOIN LATERAL aclexplode(d.defaclacl) x
+  WHERE d.defaclnamespace = 'managed'::regnamespace
+    AND pg_get_userbyid(d.defaclrole) = 'deployer'
+    AND pg_get_userbyid(x.grantee) = 'app_reader'
+    AND x.privilege_type = 'SELECT'
+)`).Scan(&hasDefaultSelect))
+	require.True(t, hasDefaultSelect)
+	var calculated int
+	require.NoError(t, admin.QueryRowContext(ctx, `SELECT managed.calculate(1)`).Scan(&calculated))
+	require.Equal(t, 2, calculated)
 }
 
 func TestReviewRetiringSchemaOwnerCannotCreateBeforeDrop(t *testing.T) {
@@ -247,6 +285,77 @@ owner = "active"
 		ApplicationName: "pgschema-review-retiring-owner-test", SSLMode: "disable",
 	}, sharedEmbeddedPG)
 	require.ErrorContains(t, err, `retiring schema execution role "retiring" would own newly created objects`)
+}
+
+func TestReviewSessionAdminMembershipRevocationRunsLast(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	target := testutil.SetupPostgres(t)
+	defer target.Stop()
+	admin, host, port, database, _, _ := testutil.ConnectToPostgres(t, target)
+	defer admin.Close()
+	_, err := admin.ExecContext(ctx, `
+CREATE ROLE deployer LOGIN NOINHERIT CREATEROLE PASSWORD 'deployer-pass';
+SET ROLE deployer;
+CREATE ROLE app_group;
+CREATE ROLE z_user;
+RESET ROLE;
+`)
+	require.NoError(t, err)
+	majorVersion, err := detectPostgresMajorVersion(admin)
+	require.NoError(t, err)
+	if majorVersion >= 16 {
+		t.Skip("session-granted self ADMIN memberships are only constructible before PostgreSQL 16")
+	}
+	grantAdmin := "GRANT app_group TO deployer WITH ADMIN OPTION"
+	grantUser := "GRANT app_group TO z_user"
+	_, err = admin.ExecContext(ctx, "SET ROLE deployer; "+grantAdmin+"; "+grantUser+"; RESET ROLE")
+	require.NoError(t, err)
+	dir := t.TempDir()
+	schemaFile := filepath.Join(dir, "schema.sql")
+	require.NoError(t, os.WriteFile(schemaFile, nil, 0o600))
+	globalFile := filepath.Join(dir, "global.toml")
+	require.NoError(t, os.WriteFile(globalFile, []byte(`
+version = 1
+[[roles]]
+name = "app_group"
+state = "external"
+[[roles]]
+name = "deployer"
+state = "external"
+[[roles]]
+name = "z_user"
+state = "external"
+[[memberships]]
+role = "app_group"
+member = "deployer"
+state = "absent"
+[[memberships]]
+role = "app_group"
+member = "z_user"
+state = "absent"
+`), 0o600))
+	config := &planCmd.PlanConfig{
+		Host: host, Port: port, DB: database, User: "deployer", Password: "deployer-pass",
+		Schema: "public", File: schemaFile, GlobalFile: globalFile,
+		ApplicationName: "pgschema-review-admin-revoke-test", SSLMode: "disable",
+	}
+	migrationPlan, err := planCmd.GeneratePlan(config, sharedEmbeddedPG)
+	require.NoError(t, err)
+	require.NoError(t, ApplyMigration(&ApplyConfig{
+		Host: host, Port: port, DB: database, User: "deployer", Password: "deployer-pass",
+		Schema: "public", Plan: migrationPlan, AutoApprove: true, Quiet: true,
+		ApplicationName: "pgschema-review-admin-revoke-test", SSLMode: "disable",
+	}, nil))
+	var memberships int
+	require.NoError(t, admin.QueryRowContext(ctx, `
+SELECT count(*) FROM pg_auth_members m
+JOIN pg_roles r ON r.oid = m.roleid
+JOIN pg_roles u ON u.oid = m.member
+WHERE r.rolname = 'app_group' AND u.rolname IN ('deployer', 'z_user')`).Scan(&memberships))
+	require.Zero(t, memberships)
 }
 
 func TestReviewOwnershipTransferUsesOldOwnerAuthority(t *testing.T) {

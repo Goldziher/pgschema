@@ -238,6 +238,11 @@ func PlanChanges(manifest Manifest, current Snapshot, majorVersion int) ([]Chang
 			Path: key.Path(), Phase: "post", DefaultPrivilege: &privilegeCopy,
 		})
 	}
+	sort.SliceStable(finalMembershipChanges, func(i, j int) bool {
+		iConsumesAuthority := finalMembershipChanges[i].Membership != nil && finalMembershipChanges[i].Membership.Member == current.SessionRole.Name
+		jConsumesAuthority := finalMembershipChanges[j].Membership != nil && finalMembershipChanges[j].Membership.Member == current.SessionRole.Name
+		return !iConsumesAuthority && jConsumesAuthority
+	})
 	changes = append(changes, finalMembershipChanges...)
 	changes = append(changes, finalRoleChanges...)
 	if err := preflightRoleAuthority(manifest, current, changes, majorVersion); err != nil {

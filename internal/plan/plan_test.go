@@ -28,6 +28,30 @@ func TestReviewToSQLRendersExecutionRole(t *testing.T) {
 	require.Equal(t, "SET ROLE app_owner;\nCREATE INDEX CONCURRENTLY idx_documents ON documents (id);\nRESET ROLE;\n", sql)
 }
 
+func TestReviewRoutineExecutionIdentityDoesNotChangePublicPath(t *testing.T) {
+	routine := &ir.Function{
+		Schema: "public",
+		Name:   "calculate",
+		Parameters: []*ir.Parameter{{
+			DataType: "integer",
+			Mode:     "IN",
+		}},
+	}
+	diffs := []diff.Diff{{
+		Statements: []diff.SQLStatement{{SQL: "COMMENT ON FUNCTION calculate(integer) IS 'integer';"}},
+		Type:       diff.DiffTypeFunction,
+		Operation:  diff.DiffOperationAlter,
+		Path:       "public.calculate",
+		Source:     routine,
+	}}
+
+	groups := groupDiffs(diffs, 15, nil)
+	require.Len(t, groups, 1)
+	require.Len(t, groups[0].Steps, 1)
+	require.Equal(t, "public.calculate", groups[0].Steps[0].Path)
+	require.Equal(t, "public.calculate(integer)", groups[0].Steps[0].ExecutionIdentity)
+}
+
 // sharedTestPostgres is the shared embedded postgres instance for all tests in this package
 var sharedTestPostgres *postgres.EmbeddedPostgres
 

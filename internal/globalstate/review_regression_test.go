@@ -341,6 +341,42 @@ func TestReviewMembershipAuthorityReductionRunsAfterOwnershipTransfer(t *testing
 	require.Equal(t, "final", changes[1].Phase)
 }
 
+func TestReviewSessionAdminRevocationRunsAfterOtherMembershipRevokes(t *testing.T) {
+	manifest := Manifest{
+		Version: 1,
+		Roles: []Role{
+			{Name: "app_group", State: StateExternal},
+			{Name: "deployer", State: StateExternal},
+			{Name: "z_user", State: StateExternal},
+		},
+		Memberships: []Membership{
+			{Role: "app_group", Member: "deployer", State: StateAbsent, Inherit: true, Set: true},
+			{Role: "app_group", Member: "z_user", State: StateAbsent, Inherit: true, Set: true},
+		},
+	}
+	current := Snapshot{
+		SessionRole:       RoleState{Name: "deployer"},
+		SessionAdminRoles: map[string]bool{"app_group": true},
+		Roles: map[string]RoleState{
+			"app_group": {Name: "app_group"}, "deployer": {Name: "deployer"}, "z_user": {Name: "z_user"},
+		},
+		Memberships: map[MembershipRef]MembershipState{
+			MembershipKey("app_group", "deployer"): {
+				Role: "app_group", Member: "deployer", Admin: true, Inherit: true, Set: true,
+			},
+			MembershipKey("app_group", "z_user"): {
+				Role: "app_group", Member: "z_user", Inherit: true, Set: true,
+			},
+		},
+	}
+
+	changes, err := PlanChanges(manifest, current, 15)
+	require.NoError(t, err)
+	require.Len(t, changes, 2)
+	require.Equal(t, "z_user", changes[0].Membership.Member)
+	require.Equal(t, "deployer", changes[1].Membership.Member)
+}
+
 func TestReviewRefusesDropRoleWithUnmanagedDependencies(t *testing.T) {
 	manifest := Manifest{Version: 1, Roles: []Role{{Name: "retired", State: StateAbsent}}}
 	current := Snapshot{
