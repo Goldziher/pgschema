@@ -433,9 +433,10 @@ func GeneratePlan(config *PlanConfig, provider postgres.DesiredStateProvider) (*
 			return nil, err
 		}
 		schemaOwnership := globalstate.OwnershipRef{Kind: "schema", Name: config.Schema}
+		executionRole := ""
 		if currentOwner, exists := currentGlobalState.Ownership[schemaOwnership]; exists &&
 			currentOwner.Owner != currentGlobalState.SessionRole.Name {
-			migrationPlan.SetExecutionRole(currentOwner.Owner)
+			executionRole = currentOwner.Owner
 		}
 		globalFingerprint, err := globalstate.ComputeFingerprint(currentGlobalState, selection)
 		if err != nil {
@@ -445,6 +446,10 @@ func GeneratePlan(config *PlanConfig, provider postgres.DesiredStateProvider) (*
 		if err != nil {
 			return nil, fmt.Errorf("failed to plan global state: %w", err)
 		}
+		if err := globalstate.ValidateExecutionRole(*globalManifest, currentGlobalState, executionRole, targetMajorVersion); err != nil {
+			return nil, fmt.Errorf("failed to plan schema execution role: %w", err)
+		}
+		migrationPlan.SetExecutionRole(executionRole)
 		preSteps := make([]plan.Step, 0, len(globalChanges))
 		postChanges := make([]globalstate.Change, 0, len(globalChanges))
 		finalChanges := make([]globalstate.Change, 0, len(globalChanges))

@@ -41,6 +41,9 @@ func TestReviewSelfAuthorityRevocationRunsAfterDependentOwnership(t *testing.T) 
 		Ownership: map[OwnershipRef]OwnershipState{
 			ownershipKey("table", "public.documents"): {Kind: "table", Name: "public.documents", Owner: "deployer"},
 		},
+		NewOwnerCreatePrivileges: map[OwnershipRef]bool{
+			ownershipKey("table", "public.documents"): true,
+		},
 	}
 
 	changes, err := PlanChanges(manifest, current, 18)
@@ -175,4 +178,137 @@ func TestReviewCompositeKeysDoNotCollideOnSlash(t *testing.T) {
 		defaultPrivilegeKey("a/b", "tables", "c"),
 		defaultPrivilegeKey("a", "b/tables", "c"),
 	)
+}
+
+func TestReviewUnchangedSchemaOwnerRequiresExecutionRoleAuthority(t *testing.T) {
+	manifest := Manifest{
+		Version: 1,
+		Roles: []Role{
+			{Name: "deployer", State: StateExternal},
+			{Name: "app_owner", State: StateExternal},
+		},
+		Ownership: []Ownership{{Kind: "schema", Name: "managed", Owner: "app_owner"}},
+	}
+	current := Snapshot{
+		SessionRole:     RoleState{Name: "deployer"},
+		SessionSetRoles: map[string]bool{},
+		Roles: map[string]RoleState{
+			"deployer":  {Name: "deployer"},
+			"app_owner": {Name: "app_owner"},
+		},
+		Ownership: map[OwnershipRef]OwnershipState{
+			ownershipKey("schema", "managed"): {Kind: "schema", Name: "managed", Owner: "app_owner"},
+		},
+	}
+
+	err := ValidateExecutionRole(manifest, current, "app_owner", 18)
+	require.ErrorContains(t, err, `session role "deployer" lacks SET authority on schema execution role "app_owner"`)
+
+	manifest.Memberships = []Membership{{
+		Role: "app_owner", Member: "deployer", State: StatePresent,
+		Admin: false, Inherit: false, Set: true,
+	}}
+	require.NoError(t, ValidateExecutionRole(manifest, current, "app_owner", 18))
+}
+
+func TestReviewSuperuserLossRunsAfterDependentChanges(t *testing.T) {
+	manifest := Manifest{
+		Version: 1,
+		Roles: []Role{
+			{Name: "deployer", State: StatePresent, Login: true, Inherit: true, ConnectionLimit: -1},
+			{Name: "app_owner", State: StateExternal},
+		},
+		Ownership: []Ownership{{Kind: "table", Name: "public.documents", Owner: "app_owner"}},
+	}
+	current := Snapshot{
+		SessionRole: RoleState{Name: "deployer", Superuser: true},
+		Roles: map[string]RoleState{
+			"deployer":  {Name: "deployer", Superuser: true, Login: true, Inherit: true, ConnectionLimit: -1, ValidUntil: "infinity"},
+			"app_owner": {Name: "app_owner"},
+		},
+		Ownership: map[OwnershipRef]OwnershipState{
+			ownershipKey("table", "public.documents"): {Kind: "table", Name: "public.documents", Owner: "deployer"},
+		},
+	}
+
+	changes, err := PlanChanges(manifest, current, 18)
+	require.NoError(t, err)
+	require.Len(t, changes, 2)
+	require.Equal(t, "ownership", changes[0].Type)
+	require.Equal(t, "role", changes[1].Type)
+	require.Equal(t, "final", changes[1].Phase)
+}
+
+func TestReviewRejectsForeignGrantorAuthorityReduction(t *testing.T) {
+	manifest := Manifest{
+		Version: 1,
+		Roles: []Role{
+			{Name: "app_group", State: StateExternal},
+			{Name: "app_login", State: StateExternal},
+		},
+		Memberships: []Membership{{
+			Role: "app_group", Member: "app_login", State: StatePresent,
+			Admin: false, Inherit: true, Set: true,
+		}},
+	}
+	current := Snapshot{
+		SessionRole:       RoleState{Name: "deployer", CreateRole: true},
+		SessionAdminRoles: map[string]bool{"app_group": true},
+		Roles: map[string]RoleState{
+			"app_group": {Name: "app_group"},
+			"app_login": {Name: "app_login"},
+		},
+		Memberships: map[MembershipRef]MembershipState{
+			MembershipKey("app_group", "app_login"): {
+				Role: "app_group", Member: "app_login", Admin: true, Inherit: true, Set: true,
+				Grantors: []string{"provider_admin"},
+			},
+		},
+	}
+
+	_, err := PlanChanges(manifest, current, 18)
+	require.ErrorContains(t, err, `membership "9:app_group9:app_login" is owned by foreign grantor "provider_admin" and cannot be safely altered`)
+
+	manifest.Memberships[0].State = StateAbsent
+	_, err = PlanChanges(manifest, current, 18)
+	require.ErrorContains(t, err, `membership "9:app_group9:app_login" is owned by foreign grantor "provider_admin" and cannot be safely revoked`)
+}
+
+func TestReviewOwnershipTransferValidatesEffectiveExecutorAndNewOwner(t *testing.T) {
+	manifest := Manifest{
+		Version: 1,
+		Roles: []Role{
+			{Name: "deployer", State: StateExternal},
+			{Name: "old_owner", State: StateExternal},
+			{Name: "new_owner", State: StateExternal},
+		},
+		Ownership: []Ownership{{Kind: "database", Name: "app", Owner: "new_owner"}},
+	}
+	ref := ownershipKey("database", "app")
+	current := Snapshot{
+		SessionRole:     RoleState{Name: "deployer", CreateDB: true},
+		SessionSetRoles: map[string]bool{"old_owner": true, "new_owner": true},
+		OwnerSetRoles:   map[RoleTransition]bool{{From: "old_owner", To: "new_owner"}: true},
+		Roles: map[string]RoleState{
+			"deployer":  {Name: "deployer", CreateDB: true},
+			"old_owner": {Name: "old_owner"},
+			"new_owner": {Name: "new_owner", CreateDB: true},
+		},
+		Ownership:                     map[OwnershipRef]OwnershipState{ref: {Kind: "database", Name: "app", Owner: "old_owner"}},
+		NewOwnerCreatePrivileges:      map[OwnershipRef]bool{ref: true},
+		CurrentOwnerDatabaseAuthority: map[OwnershipRef]bool{ref: false},
+	}
+
+	_, err := PlanChanges(manifest, current, 18)
+	require.ErrorContains(t, err, `current owner role "old_owner" lacks CREATEDB required to change database ownership`)
+
+	current.CurrentOwnerDatabaseAuthority[ref] = true
+	current.NewOwnerCreatePrivileges[ref] = false
+	current.Roles["new_owner"] = RoleState{Name: "new_owner"}
+	_, err = PlanChanges(manifest, current, 18)
+	require.ErrorContains(t, err, `new owner role "new_owner" lacks required CREATE authority for database "app"`)
+
+	current.NewOwnerCreatePrivileges[ref] = true
+	_, err = PlanChanges(manifest, current, 18)
+	require.NoError(t, err)
 }

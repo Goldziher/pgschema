@@ -126,6 +126,11 @@ func PlanChanges(manifest Manifest, current Snapshot, majorVersion int) ([]Chang
 				if majorVersion >= 16 && len(actual.Grantors) > 1 {
 					return nil, fmt.Errorf("membership %q has multiple grantors and cannot be safely revoked", key.Path())
 				}
+				if majorVersion >= 16 {
+					if grantor, foreign := foreignMembershipGrantor(actual, current.SessionRole.Name); foreign {
+						return nil, fmt.Errorf("membership %q is owned by foreign grantor %q and cannot be safely revoked", key.Path(), grantor)
+					}
+				}
 				if membership.Member == current.SessionRole.Name {
 					change.Phase = "final"
 					finalMembershipChanges = append(finalMembershipChanges, change)
@@ -158,6 +163,11 @@ func PlanChanges(manifest Manifest, current Snapshot, majorVersion int) ([]Chang
 		}
 		if majorVersion >= 16 && len(actual.Grantors) > 1 {
 			return nil, fmt.Errorf("membership %q has multiple grantors and cannot be safely altered", key.Path())
+		}
+		if majorVersion >= 16 && membershipReducesAuthority(membership, actual, majorVersion) {
+			if grantor, foreign := foreignMembershipGrantor(actual, current.SessionRole.Name); foreign {
+				return nil, fmt.Errorf("membership %q is owned by foreign grantor %q and cannot be safely altered", key.Path(), grantor)
+			}
 		}
 		if majorVersion < 16 && actual.Admin && !membership.Admin {
 			change := Change{
@@ -279,7 +289,8 @@ func preflightRoleAuthority(manifest Manifest, current Snapshot, changes []Chang
 			}
 		case "ownership":
 			object := *change.Ownership
-			actual, exists := current.Ownership[ownershipKey(object.Kind, object.Name)]
+			ref := ownershipKey(object.Kind, object.Name)
+			actual, exists := current.Ownership[ref]
 			if exists && actual.Owner != current.SessionRole.Name && !current.SessionSetRoles[actual.Owner] &&
 				!plannedSet[MembershipKey(actual.Owner, current.SessionRole.Name)] {
 				return fmt.Errorf("session role %q cannot assume current owner role %q for %s", current.SessionRole.Name, actual.Owner, change.Path)
@@ -293,8 +304,16 @@ func preflightRoleAuthority(manifest Manifest, current Snapshot, changes []Chang
 				!plannedSet[MembershipKey(object.Owner, current.SessionRole.Name)] {
 				return fmt.Errorf("session role %q lacks SET authority on new owner role %q for %s; declare a SET-enabled membership", current.SessionRole.Name, object.Owner, change.Path)
 			}
-			if object.Kind == "database" && !current.SessionRole.CreateDB {
-				return fmt.Errorf("session role %q lacks CREATEDB required to change database ownership", current.SessionRole.Name)
+			if object.Kind == "database" {
+				if exists && actual.Owner != current.SessionRole.Name && !current.CurrentOwnerDatabaseAuthority[ref] {
+					return fmt.Errorf("current owner role %q lacks CREATEDB required to change database ownership", actual.Owner)
+				}
+				if (!exists || actual.Owner == current.SessionRole.Name) && !current.SessionRole.CreateDB {
+					return fmt.Errorf("session role %q lacks CREATEDB required to change database ownership", current.SessionRole.Name)
+				}
+			}
+			if !current.NewOwnerCreatePrivileges[ref] && !plannedOwnerCreateAuthority(manifest, current, object) {
+				return fmt.Errorf("new owner role %q lacks required CREATE authority for %s %q", object.Owner, object.Kind, object.Name)
 			}
 		case "global_default_privilege":
 			privilege := *change.DefaultPrivilege
@@ -320,6 +339,13 @@ func membershipRef(membership Membership) *MembershipRef {
 	return &MembershipRef{Role: membership.Role, Member: membership.Member}
 }
 
+func foreignMembershipGrantor(actual MembershipState, sessionRole string) (string, bool) {
+	if len(actual.Grantors) != 1 || actual.Grantors[0] == sessionRole {
+		return "", false
+	}
+	return actual.Grantors[0], true
+}
+
 func membershipReducesAuthority(desired Membership, actual MembershipState, majorVersion int) bool {
 	if actual.Admin && !desired.Admin {
 		return true
@@ -328,8 +354,58 @@ func membershipReducesAuthority(desired Membership, actual MembershipState, majo
 }
 
 func roleReducesAuthority(desired Role, actual RoleState) bool {
-	return (actual.CreateRole && !desired.CreateRole) || (actual.CreateDB && !desired.CreateDB) ||
+	return actual.Superuser || (actual.CreateRole && !desired.CreateRole) || (actual.CreateDB && !desired.CreateDB) ||
 		(actual.Inherit && !desired.Inherit)
+}
+
+func ValidateExecutionRole(manifest Manifest, current Snapshot, executionRole string, majorVersion int) error {
+	if executionRole == "" || executionRole == current.SessionRole.Name || current.SessionRole.Superuser ||
+		current.SessionSetRoles[executionRole] {
+		return nil
+	}
+	for _, membership := range manifest.Memberships {
+		if membership.State == StatePresent && membership.Role == executionRole &&
+			membership.Member == current.SessionRole.Name && (majorVersion < 16 || membership.Set) {
+			return nil
+		}
+	}
+	return fmt.Errorf("session role %q lacks SET authority on schema execution role %q; declare a SET-enabled membership", current.SessionRole.Name, executionRole)
+}
+
+func plannedOwnerCreateAuthority(manifest Manifest, current Snapshot, object Ownership) bool {
+	if object.Kind == "database" {
+		for _, role := range manifest.Roles {
+			if role.Name == object.Owner && role.State == StatePresent && role.CreateDB {
+				return true
+			}
+		}
+		role := current.Roles[object.Owner]
+		return role.Superuser || role.CreateDB
+	}
+	if object.Kind == "schema" {
+		return current.DatabaseName != "" &&
+			manifestTransfersContainerOwnership(manifest, "database", current.DatabaseName, object.Owner)
+	}
+	schema := ""
+	if object.Kind == "function" || object.Kind == "procedure" {
+		open := strings.IndexByte(object.Name, '(')
+		if open < 0 {
+			return false
+		}
+		schema, _, _ = splitQualifiedName(object.Name[:open])
+	} else {
+		schema, _, _ = splitQualifiedName(object.Name)
+	}
+	return schema != "" && manifestTransfersContainerOwnership(manifest, "schema", schema, object.Owner)
+}
+
+func manifestTransfersContainerOwnership(manifest Manifest, kind, name, owner string) bool {
+	for _, candidate := range manifest.Ownership {
+		if candidate.Kind == kind && candidate.Owner == owner && (name == "" || candidate.Name == name) {
+			return true
+		}
+	}
+	return false
 }
 
 func roleDiffers(desired Role, actual RoleState) bool {

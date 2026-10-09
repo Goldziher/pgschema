@@ -78,6 +78,28 @@ owner = "app_owner"
 		Schema: "managed", File: schemaFile, GlobalFile: globalFile,
 		ApplicationName: "pgschema-review-schema-owner-test", SSLMode: "disable",
 	}
+	unauthorizedGlobalFile := filepath.Join(dir, "global-unauthorized.toml")
+	require.NoError(t, os.WriteFile(unauthorizedGlobalFile, []byte(`
+version = 1
+
+[[roles]]
+name = "app_owner"
+state = "external"
+
+[[roles]]
+name = "deployer"
+state = "external"
+
+[[ownership]]
+kind = "schema"
+name = "managed"
+owner = "app_owner"
+`), 0o600))
+	unauthorizedConfig := *config
+	unauthorizedConfig.GlobalFile = unauthorizedGlobalFile
+	_, err = planCmd.GeneratePlan(&unauthorizedConfig, sharedEmbeddedPG)
+	require.ErrorContains(t, err, `lacks SET authority on schema execution role "app_owner"`)
+
 	migrationPlan, err := planCmd.GeneratePlan(config, sharedEmbeddedPG)
 	require.NoError(t, err)
 	var titleExists bool
@@ -124,7 +146,6 @@ CREATE ROLE deployer LOGIN NOINHERIT CREATEROLE PASSWORD 'deployer-pass';
 CREATE ROLE old_owner;
 CREATE ROLE new_owner;
 GRANT CREATE ON SCHEMA public TO old_owner;
-GRANT CREATE ON SCHEMA public TO new_owner;
 CREATE TABLE public.documents (id bigint PRIMARY KEY);
 ALTER TABLE public.documents OWNER TO old_owner;
 `)
@@ -163,6 +184,13 @@ ALTER TABLE public.documents OWNER TO old_owner;
 		}},
 		Ownership: selection.Ownership,
 	}
+	_, err = globalstate.PlanChanges(manifest, snapshot, majorVersion)
+	require.ErrorContains(t, err, `new owner role "new_owner" lacks required CREATE authority`)
+
+	_, err = admin.ExecContext(ctx, `GRANT CREATE ON SCHEMA public TO new_owner`)
+	require.NoError(t, err)
+	snapshot, err = globalstate.Inspect(ctx, deployer, selection, majorVersion)
+	require.NoError(t, err)
 	changes, err := globalstate.PlanChanges(manifest, snapshot, majorVersion)
 	require.NoError(t, err)
 	require.Len(t, changes, 2)
@@ -221,4 +249,79 @@ RESET ROLE;
 
 	_, err = globalstate.PlanChanges(manifest, snapshot, majorVersion)
 	require.ErrorContains(t, err, "multiple grantors")
+
+	_, err = admin.ExecContext(ctx, `REVOKE app_group FROM app_login GRANTED BY grantor_two`)
+	require.NoError(t, err)
+	snapshot, err = globalstate.Inspect(ctx, admin, selection, majorVersion)
+	require.NoError(t, err)
+	manifest.Memberships[0].State = globalstate.StateAbsent
+	_, err = globalstate.PlanChanges(manifest, snapshot, majorVersion)
+	require.ErrorContains(t, err, `foreign grantor "grantor_one"`)
+}
+
+func TestReviewDatabaseOwnershipTransferValidatesEffectiveExecutor(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	target := testutil.SetupPostgres(t)
+	defer target.Stop()
+	admin, host, port, database, _, _ := testutil.ConnectToPostgres(t, target)
+	defer admin.Close()
+	majorVersion, err := detectPostgresMajorVersion(admin)
+	require.NoError(t, err)
+
+	_, err = admin.ExecContext(ctx, `
+CREATE ROLE deployer LOGIN CREATEDB CREATEROLE PASSWORD 'deployer-pass';
+CREATE ROLE old_owner;
+CREATE ROLE new_owner CREATEDB;
+`)
+	require.NoError(t, err)
+	grantOldOwner := "GRANT old_owner TO deployer"
+	grantNewOwner := "GRANT new_owner TO deployer WITH ADMIN OPTION"
+	grantTransition := "GRANT new_owner TO old_owner"
+	if majorVersion >= 16 {
+		grantOldOwner += " WITH ADMIN FALSE, INHERIT FALSE, SET TRUE"
+		grantNewOwner = "GRANT new_owner TO deployer WITH ADMIN TRUE, INHERIT FALSE, SET TRUE"
+		grantTransition += " WITH ADMIN FALSE, INHERIT FALSE, SET TRUE"
+	}
+	_, err = admin.ExecContext(ctx, fmt.Sprintf("%s;\n%s;\n%s;", grantOldOwner, grantNewOwner, grantTransition))
+	require.NoError(t, err)
+	_, err = admin.ExecContext(ctx, `CREATE DATABASE review_owned_db OWNER old_owner`)
+	require.NoError(t, err)
+
+	deployer, err := util.Connect(&util.ConnectionConfig{
+		Host: host, Port: port, Database: database, User: "deployer", Password: "deployer-pass",
+		SSLMode: "disable", ApplicationName: "pgschema-review-database-owner-test",
+	})
+	require.NoError(t, err)
+	defer deployer.Close()
+	selection := globalstate.Selection{
+		Roles: []string{"deployer", "old_owner", "new_owner"},
+		Ownership: []globalstate.Ownership{{
+			Kind: "database", Name: "review_owned_db", Owner: "new_owner",
+		}},
+	}
+	manifest := globalstate.Manifest{
+		Version: 1,
+		Roles: []globalstate.Role{
+			{Name: "deployer", State: globalstate.StateExternal},
+			{Name: "old_owner", State: globalstate.StateExternal},
+			{Name: "new_owner", State: globalstate.StateExternal},
+		},
+		Ownership: selection.Ownership,
+	}
+	snapshot, err := globalstate.Inspect(ctx, deployer, selection, majorVersion)
+	require.NoError(t, err)
+	_, err = globalstate.PlanChanges(manifest, snapshot, majorVersion)
+	require.ErrorContains(t, err, `current owner role "old_owner" lacks CREATEDB`)
+
+	_, err = admin.ExecContext(ctx, `ALTER ROLE old_owner CREATEDB`)
+	require.NoError(t, err)
+	snapshot, err = globalstate.Inspect(ctx, deployer, selection, majorVersion)
+	require.NoError(t, err)
+	changes, err := globalstate.PlanChanges(manifest, snapshot, majorVersion)
+	require.NoError(t, err)
+	require.Len(t, changes, 1)
+	require.Contains(t, changes[0].SQL, `SET ROLE old_owner; ALTER DATABASE review_owned_db OWNER TO new_owner; RESET ROLE`)
 }

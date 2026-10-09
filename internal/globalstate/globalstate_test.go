@@ -325,6 +325,9 @@ func TestPlanChangesRequiresDeclaredSetMembershipForNewOwner(t *testing.T) {
 		SessionSetRoles:   map[string]bool{},
 		Roles:             map[string]RoleState{"deployer": {Name: "deployer"}},
 		Ownership:         map[OwnershipRef]OwnershipState{},
+		NewOwnerCreatePrivileges: map[OwnershipRef]bool{
+			ownershipKey("table", "public.documents"): true,
+		},
 		DefaultPrivileges: map[DefaultPrivilegeRef]DefaultPrivilegeState{
 			defaultPrivilegeKey("app_owner", "functions", "PUBLIC"): {
 				Owner: "app_owner", ObjectType: "functions", Grantee: "PUBLIC",

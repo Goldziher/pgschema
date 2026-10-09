@@ -36,14 +36,17 @@ type MembershipState struct {
 }
 
 type Snapshot struct {
-	Roles             map[string]RoleState
-	Memberships       map[MembershipRef]MembershipState
-	Ownership         map[OwnershipRef]OwnershipState
-	DefaultPrivileges map[DefaultPrivilegeRef]DefaultPrivilegeState
-	SessionRole       RoleState
-	SessionAdminRoles map[string]bool
-	SessionSetRoles   map[string]bool
-	OwnerSetRoles     map[RoleTransition]bool
+	Roles                         map[string]RoleState
+	Memberships                   map[MembershipRef]MembershipState
+	Ownership                     map[OwnershipRef]OwnershipState
+	DefaultPrivileges             map[DefaultPrivilegeRef]DefaultPrivilegeState
+	SessionRole                   RoleState
+	SessionAdminRoles             map[string]bool
+	SessionSetRoles               map[string]bool
+	OwnerSetRoles                 map[RoleTransition]bool
+	NewOwnerCreatePrivileges      map[OwnershipRef]bool
+	CurrentOwnerDatabaseAuthority map[OwnershipRef]bool
+	DatabaseName                  string
 }
 
 type OwnershipState struct {
@@ -127,13 +130,15 @@ func SelectionFor(manifest Manifest) Selection {
 func Inspect(ctx context.Context, db *sql.DB, selection Selection, majorVersion int) (Snapshot, error) {
 	normalizeSelection(&selection)
 	snapshot := Snapshot{
-		Roles:             make(map[string]RoleState),
-		Memberships:       make(map[MembershipRef]MembershipState),
-		Ownership:         make(map[OwnershipRef]OwnershipState),
-		DefaultPrivileges: make(map[DefaultPrivilegeRef]DefaultPrivilegeState),
-		SessionAdminRoles: make(map[string]bool),
-		SessionSetRoles:   make(map[string]bool),
-		OwnerSetRoles:     make(map[RoleTransition]bool),
+		Roles:                         make(map[string]RoleState),
+		Memberships:                   make(map[MembershipRef]MembershipState),
+		Ownership:                     make(map[OwnershipRef]OwnershipState),
+		DefaultPrivileges:             make(map[DefaultPrivilegeRef]DefaultPrivilegeState),
+		SessionAdminRoles:             make(map[string]bool),
+		SessionSetRoles:               make(map[string]bool),
+		OwnerSetRoles:                 make(map[RoleTransition]bool),
+		NewOwnerCreatePrivileges:      make(map[OwnershipRef]bool),
+		CurrentOwnerDatabaseAuthority: make(map[OwnershipRef]bool),
 	}
 	var sessionConfig pq.StringArray
 	if err := db.QueryRowContext(ctx, `
@@ -152,6 +157,9 @@ FROM pg_catalog.pg_roles WHERE rolname = current_user`).Scan(
 		return Snapshot{}, fmt.Errorf("inspect session role: %w", err)
 	}
 	snapshot.SessionRole.Configuration = parseRoleConfiguration(sessionConfig)
+	if err := db.QueryRowContext(ctx, `SELECT current_database()`).Scan(&snapshot.DatabaseName); err != nil {
+		return Snapshot{}, fmt.Errorf("inspect current database: %w", err)
+	}
 	adminRows, err := db.QueryContext(ctx, `
 SELECT granted.rolname
 FROM pg_catalog.pg_auth_members m
@@ -259,12 +267,25 @@ ORDER BY granted.rolname, member.rolname`, options))
 		}
 	}
 	for _, object := range selection.Ownership {
+		ref := ownershipKey(object.Kind, object.Name)
+		canCreate, err := inspectNewOwnerCreatePrivilege(ctx, db, object)
+		if err != nil {
+			return Snapshot{}, err
+		}
+		snapshot.NewOwnerCreatePrivileges[ref] = canCreate
 		state, exists, err := inspectOwnership(ctx, db, object)
 		if err != nil {
 			return Snapshot{}, err
 		}
 		if exists {
-			snapshot.Ownership[ownershipKey(object.Kind, object.Name)] = state
+			snapshot.Ownership[ref] = state
+			if object.Kind == "database" {
+				canAlterDatabase, err := inspectRoleDatabaseAuthority(ctx, db, state.Owner)
+				if err != nil {
+					return Snapshot{}, err
+				}
+				snapshot.CurrentOwnerDatabaseAuthority[ref] = canAlterDatabase
+			}
 			transition := RoleTransition{From: state.Owner, To: object.Owner}
 			_, desiredOwnerExists := snapshot.Roles[object.Owner]
 			if desiredOwnerExists && !snapshot.SessionRole.Superuser && state.Owner != snapshot.SessionRole.Name {
@@ -320,10 +341,13 @@ func ComputeFingerprint(snapshot Snapshot, selection Selection) (*Fingerprint, e
 		DefaultPrivileges []*DefaultPrivilegeState `json:"default_privileges"`
 		Authority         authorityState           `json:"authority"`
 		OwnerTransitions  []ownerTransitionState   `json:"owner_transitions,omitempty"`
+		OwnerCreate       []bool                   `json:"owner_create"`
+		OwnerDatabase     []bool                   `json:"owner_database"`
 	}
 	authority := authorityState{
 		Name: snapshot.SessionRole.Name, Superuser: snapshot.SessionRole.Superuser,
 		CreateRole: snapshot.SessionRole.CreateRole, CreateDB: snapshot.SessionRole.CreateDB,
+		Database: snapshot.DatabaseName,
 	}
 	relevantAuthorityRoles := make(map[string]struct{}, len(selection.Roles)+len(selection.Ownership))
 	for _, name := range selection.Roles {
@@ -357,7 +381,10 @@ func ComputeFingerprint(snapshot Snapshot, selection Selection) (*Fingerprint, e
 			encodePath(state.OwnerTransitions[j].From, state.OwnerTransitions[j].To)
 	})
 	for _, object := range selection.Ownership {
-		if stateValue, exists := snapshot.Ownership[ownershipKey(object.Kind, object.Name)]; exists {
+		ref := ownershipKey(object.Kind, object.Name)
+		state.OwnerCreate = append(state.OwnerCreate, snapshot.NewOwnerCreatePrivileges[ref])
+		state.OwnerDatabase = append(state.OwnerDatabase, snapshot.CurrentOwnerDatabaseAuthority[ref])
+		if stateValue, exists := snapshot.Ownership[ref]; exists {
 			copy := stateValue
 			state.Ownership = append(state.Ownership, &copy)
 		} else {
@@ -403,6 +430,7 @@ type authorityState struct {
 	CreateDB   bool     `json:"createdb"`
 	AdminRoles []string `json:"admin_roles,omitempty"`
 	SetRoles   []string `json:"set_roles,omitempty"`
+	Database   string   `json:"database"`
 }
 
 type ownerTransitionState struct {
@@ -486,6 +514,59 @@ func inspectOwnership(ctx context.Context, db *sql.DB, object Ownership) (Owners
 		return OwnershipState{}, false, fmt.Errorf("inspect ownership %s: %w", ownershipKey(object.Kind, object.Name).Path(), err)
 	}
 	return state, true, nil
+}
+
+func inspectNewOwnerCreatePrivilege(ctx context.Context, db *sql.DB, object Ownership) (bool, error) {
+	var roleExists bool
+	if err := db.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $1)`, object.Owner,
+	).Scan(&roleExists); err != nil {
+		return false, fmt.Errorf("inspect new owner role %q: %w", object.Owner, err)
+	}
+	if !roleExists {
+		return false, nil
+	}
+	query := ""
+	args := []any{object.Owner}
+	switch object.Kind {
+	case "database":
+		query = `SELECT rolsuper OR rolcreatedb FROM pg_catalog.pg_roles WHERE rolname = $1`
+	case "schema":
+		query = `SELECT pg_catalog.has_database_privilege($1, current_database(), 'CREATE')`
+	case "function", "procedure":
+		open := strings.IndexByte(object.Name, '(')
+		if open < 0 {
+			return false, fmt.Errorf("routine name %q must be a safe schema-qualified identity signature", object.Name)
+		}
+		schema, _, err := splitQualifiedName(object.Name[:open])
+		if err != nil {
+			return false, err
+		}
+		query = `SELECT pg_catalog.has_schema_privilege($1, $2, 'CREATE')`
+		args = append(args, schema)
+	default:
+		schema, _, err := splitQualifiedName(object.Name)
+		if err != nil {
+			return false, err
+		}
+		query = `SELECT pg_catalog.has_schema_privilege($1, $2, 'CREATE')`
+		args = append(args, schema)
+	}
+	var allowed bool
+	if err := db.QueryRowContext(ctx, query, args...).Scan(&allowed); err != nil {
+		return false, fmt.Errorf("inspect new owner CREATE authority for %s: %w", ownershipKey(object.Kind, object.Name).Path(), err)
+	}
+	return allowed, nil
+}
+
+func inspectRoleDatabaseAuthority(ctx context.Context, db *sql.DB, role string) (bool, error) {
+	var allowed bool
+	if err := db.QueryRowContext(ctx,
+		`SELECT rolsuper OR rolcreatedb FROM pg_catalog.pg_roles WHERE rolname = $1`, role,
+	).Scan(&allowed); err != nil {
+		return false, fmt.Errorf("inspect database authority for role %q: %w", role, err)
+	}
+	return allowed, nil
 }
 
 func ownershipQuery(object Ownership) (string, []any, error) {
