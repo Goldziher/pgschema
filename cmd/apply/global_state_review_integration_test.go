@@ -142,16 +142,20 @@ func TestReviewMixedOwnerSchemaUsesAffectedObjectOwner(t *testing.T) {
 	_, err := admin.ExecContext(ctx, `
 CREATE ROLE deployer LOGIN NOINHERIT CREATEROLE PASSWORD 'deployer-pass';
 CREATE ROLE app_owner;
-CREATE ROLE app_reader;
-CREATE ROLE column_reader;
+CREATE ROLE "app.reader";
+CREATE ROLE "column.reader";
 CREATE SCHEMA managed AUTHORIZATION app_owner;
 GRANT USAGE, CREATE ON SCHEMA managed TO deployer;
 CREATE TABLE managed.documents (id bigint PRIMARY KEY);
 ALTER TABLE managed.documents OWNER TO deployer;
-CREATE FUNCTION managed.calculate(value integer) RETURNS integer LANGUAGE sql AS 'SELECT value';
-ALTER FUNCTION managed.calculate(integer) OWNER TO deployer;
-CREATE FUNCTION managed.calculate(value text) RETURNS text LANGUAGE sql AS 'SELECT value';
-ALTER FUNCTION managed.calculate(text) OWNER TO app_owner;
+CREATE TABLE managed."audit.log" (id bigint PRIMARY KEY);
+ALTER TABLE managed."audit.log" OWNER TO deployer;
+CREATE FUNCTION managed."calculate.dot"(value integer) RETURNS integer LANGUAGE sql AS 'SELECT value';
+ALTER FUNCTION managed."calculate.dot"(integer) OWNER TO deployer;
+CREATE FUNCTION managed."calculate.dot"(value text) RETURNS text LANGUAGE sql AS 'SELECT value';
+ALTER FUNCTION managed."calculate.dot"(text) OWNER TO app_owner;
+CREATE AGGREGATE managed."row.count" (*) (SFUNC = int8inc, STYPE = bigint, INITCOND = '0');
+ALTER AGGREGATE managed."row.count" (*) OWNER TO deployer;
 `)
 	require.NoError(t, err)
 	majorVersion, err := detectPostgresMajorVersion(admin)
@@ -166,11 +170,14 @@ ALTER FUNCTION managed.calculate(text) OWNER TO app_owner;
 	schemaFile := filepath.Join(dir, "schema.sql")
 	require.NoError(t, os.WriteFile(schemaFile, []byte(`
 CREATE TABLE documents (id bigint PRIMARY KEY, title text);
-CREATE FUNCTION calculate(value integer) RETURNS integer LANGUAGE sql AS 'SELECT value + 1';
-CREATE FUNCTION calculate(value text) RETURNS text LANGUAGE sql AS 'SELECT value';
-GRANT SELECT ON TABLE documents TO app_reader;
-GRANT UPDATE (title) ON TABLE documents TO column_reader;
-ALTER DEFAULT PRIVILEGES FOR ROLE deployer IN SCHEMA managed GRANT SELECT ON TABLES TO app_reader;
+CREATE TABLE "audit.log" (id bigint PRIMARY KEY, title text);
+CREATE FUNCTION "calculate.dot"(value integer) RETURNS integer LANGUAGE sql AS 'SELECT value + 1';
+CREATE FUNCTION "calculate.dot"(value text) RETURNS text LANGUAGE sql AS 'SELECT value';
+CREATE AGGREGATE "row.count" (*) (SFUNC = int8inc, STYPE = bigint, INITCOND = '0');
+COMMENT ON AGGREGATE "row.count" (*) IS 'managed count';
+GRANT SELECT ON TABLE "audit.log" TO "app.reader";
+GRANT UPDATE (title) ON TABLE "audit.log" TO "column.reader";
+ALTER DEFAULT PRIVILEGES FOR ROLE deployer IN SCHEMA managed GRANT SELECT ON TABLES TO "app.reader";
 `), 0o600))
 	globalFile := filepath.Join(dir, "global.toml")
 	require.NoError(t, os.WriteFile(globalFile, []byte(`
@@ -182,10 +189,10 @@ state = "external"
 name = "deployer"
 state = "external"
 [[roles]]
-name = "app_reader"
+name = "app.reader"
 state = "external"
 [[roles]]
-name = "column_reader"
+name = "column.reader"
 state = "external"
 [[ownership]]
 kind = "schema"
@@ -208,10 +215,10 @@ owner = "app_owner"
 	require.NoError(t, admin.QueryRowContext(ctx, `SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'managed.documents'::regclass`).Scan(&owner))
 	require.Equal(t, "deployer", owner)
 	var canSelect bool
-	require.NoError(t, admin.QueryRowContext(ctx, `SELECT has_table_privilege('app_reader', 'managed.documents', 'SELECT')`).Scan(&canSelect))
+	require.NoError(t, admin.QueryRowContext(ctx, `SELECT has_table_privilege('app.reader', 'managed."audit.log"', 'SELECT')`).Scan(&canSelect))
 	require.True(t, canSelect)
 	var canUpdateTitle bool
-	require.NoError(t, admin.QueryRowContext(ctx, `SELECT has_column_privilege('column_reader', 'managed.documents', 'title', 'UPDATE')`).Scan(&canUpdateTitle))
+	require.NoError(t, admin.QueryRowContext(ctx, `SELECT has_column_privilege('column.reader', 'managed."audit.log"', 'title', 'UPDATE')`).Scan(&canUpdateTitle))
 	require.True(t, canUpdateTitle)
 	var hasDefaultSelect bool
 	require.NoError(t, admin.QueryRowContext(ctx, `
@@ -219,13 +226,16 @@ SELECT EXISTS (
   SELECT 1 FROM pg_default_acl d CROSS JOIN LATERAL aclexplode(d.defaclacl) x
   WHERE d.defaclnamespace = 'managed'::regnamespace
     AND pg_get_userbyid(d.defaclrole) = 'deployer'
-    AND pg_get_userbyid(x.grantee) = 'app_reader'
+    AND pg_get_userbyid(x.grantee) = 'app.reader'
     AND x.privilege_type = 'SELECT'
 )`).Scan(&hasDefaultSelect))
 	require.True(t, hasDefaultSelect)
 	var calculated int
-	require.NoError(t, admin.QueryRowContext(ctx, `SELECT managed.calculate(1)`).Scan(&calculated))
+	require.NoError(t, admin.QueryRowContext(ctx, `SELECT managed."calculate.dot"(1)`).Scan(&calculated))
 	require.Equal(t, 2, calculated)
+	var aggregateComment string
+	require.NoError(t, admin.QueryRowContext(ctx, `SELECT obj_description('managed."row.count"()'::regprocedure, 'pg_proc')`).Scan(&aggregateComment))
+	require.Equal(t, "managed count", aggregateComment)
 }
 
 func TestReviewRetiringSchemaOwnerCannotCreateBeforeDrop(t *testing.T) {

@@ -577,95 +577,38 @@ func createsOwnedObject(step plan.Step) bool {
 }
 
 func inspectPlanStepOwner(ctx context.Context, db *sql.DB, step plan.Step, targetSchema string) (string, bool, error) {
-	objectType := step.Type
-	switch {
-	case objectType == "table" || strings.HasPrefix(objectType, "table."),
-		objectType == "view" || strings.HasPrefix(objectType, "view."),
-		objectType == "materialized_view" || strings.HasPrefix(objectType, "materialized_view."),
-		objectType == "sequence":
-		return inspectSinglePlanOwner(ctx, db, `
-SELECT DISTINCT pg_get_userbyid(c.relowner)
-FROM pg_catalog.pg_class c
-JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-WHERE n.nspname || '.' || c.relname = $1`, planRelationPath(step.Path))
-	case objectType == "type" || objectType == "domain":
-		return inspectSinglePlanOwner(ctx, db, `
-SELECT DISTINCT pg_get_userbyid(t.typowner)
-FROM pg_catalog.pg_type t
-JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
-WHERE n.nspname || '.' || t.typname = $1`, planRelationPath(step.Path))
-	case objectType == "function" || objectType == "procedure" || objectType == "aggregate":
-		if step.ExecutionIdentity == "" {
-			return "", false, fmt.Errorf("cannot resolve routine owner from path %q without an exact identity", step.Path)
-		}
-		kind := "f"
-		if objectType == "procedure" {
-			kind = "p"
-		} else if objectType == "aggregate" {
-			kind = "a"
-		}
-		return inspectSinglePlanOwner(ctx, db, `
-			SELECT pg_get_userbyid(p.proowner)
-			FROM pg_catalog.pg_proc p
-			WHERE p.oid = pg_catalog.to_regprocedure($1) AND p.prokind = $2`, step.ExecutionIdentity, kind)
-	case objectType == "privilege":
-		return inspectPrivilegeStepOwner(ctx, db, step.Path, targetSchema, true)
-	case objectType == "revoked_default_privilege":
-		return inspectPrivilegeStepOwner(ctx, db, step.Path, targetSchema, false)
-	case objectType == "column_privilege":
-		parts := strings.Split(step.Path, ".")
-		if len(parts) < 5 {
-			return "", false, fmt.Errorf("cannot resolve column privilege owner from path %q", step.Path)
-		}
-		return inspectRelationOwner(ctx, db, targetSchema, parts[2])
-	case objectType == "default_privilege":
-		parts := strings.Split(step.Path, ".")
-		if len(parts) < 4 || parts[1] == "" {
-			return "", false, fmt.Errorf("cannot resolve default privilege owner from path %q", step.Path)
-		}
-		return parts[1], true, nil
-	case objectType == "comment":
-		return "", false, fmt.Errorf("cannot safely resolve execution owner for generic comment %q", step.Path)
-	default:
-		return "", false, nil
+	identity := step.OwnerIdentity
+	schema := identity.Schema
+	if schema == "" {
+		schema = targetSchema
 	}
-}
-
-func inspectPrivilegeStepOwner(ctx context.Context, db *sql.DB, path, targetSchema string, hasGrantee bool) (string, bool, error) {
-	parts := strings.Split(path, ".")
-	minimum := 3
-	if hasGrantee {
-		minimum = 4
-	}
-	if len(parts) < minimum {
-		return "", false, fmt.Errorf("cannot resolve privilege owner from path %q", path)
-	}
-	objectType := parts[1]
-	end := len(parts)
-	if hasGrantee {
-		end--
-	}
-	objectName := strings.Join(parts[2:end], ".")
-	switch objectType {
-	case "TABLE", "VIEW", "SEQUENCE":
-		return inspectRelationOwner(ctx, db, targetSchema, objectName)
-	case "FUNCTION", "PROCEDURE":
-		kind := "f"
-		if objectType == "PROCEDURE" {
-			kind = "p"
-		}
-		return inspectSinglePlanOwner(ctx, db, `
-			SELECT pg_get_userbyid(p.proowner)
-			FROM pg_catalog.pg_proc p
-			WHERE p.oid = pg_catalog.to_regprocedure($1) AND p.prokind = $2`, targetSchema+"."+objectName, kind)
-	case "TYPE":
+	switch identity.Kind {
+	case diff.OwnerIdentityRelation:
+		return inspectRelationOwner(ctx, db, schema, identity.Name)
+	case diff.OwnerIdentityType:
 		return inspectSinglePlanOwner(ctx, db, `
 			SELECT pg_get_userbyid(t.typowner)
 			FROM pg_catalog.pg_type t
 			JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
-			WHERE n.nspname = $1 AND t.typname = $2`, targetSchema, objectName)
+			WHERE n.nspname = $1 AND t.typname = $2`, schema, identity.Name)
+	case diff.OwnerIdentityRoutine:
+		qualifiedIdentity := ir.QuoteIdentifier(schema) + "." + identity.Name
+		return inspectSinglePlanOwner(ctx, db, `
+			SELECT pg_get_userbyid(p.proowner)
+			FROM pg_catalog.pg_proc p
+			WHERE p.oid = pg_catalog.to_regprocedure($1) AND p.prokind = $2`, qualifiedIdentity, identity.RoutineKind)
+	case diff.OwnerIdentityDefaultPrivilege:
+		if identity.Role == "" {
+			return "", false, fmt.Errorf("cannot resolve default privilege owner from path %q", step.Path)
+		}
+		return identity.Role, true, nil
+	case "":
+		if step.Type == "comment" {
+			return "", false, fmt.Errorf("cannot safely resolve execution owner for generic comment %q", step.Path)
+		}
+		return "", false, fmt.Errorf("cannot safely resolve execution owner for %s %q", step.Type, step.Path)
 	default:
-		return "", false, fmt.Errorf("cannot resolve owner for privilege object type %q", objectType)
+		return "", false, fmt.Errorf("cannot safely resolve execution owner for %s %q", step.Type, step.Path)
 	}
 }
 
@@ -675,14 +618,6 @@ func inspectRelationOwner(ctx context.Context, db *sql.DB, schema, name string) 
 		FROM pg_catalog.pg_class c
 		JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 		WHERE n.nspname = $1 AND c.relname = $2`, schema, name)
-}
-
-func planRelationPath(path string) string {
-	parts := strings.SplitN(path, ".", 3)
-	if len(parts) < 2 {
-		return path
-	}
-	return parts[0] + "." + parts[1]
 }
 
 func inspectSinglePlanOwner(ctx context.Context, db *sql.DB, query string, args ...any) (string, bool, error) {

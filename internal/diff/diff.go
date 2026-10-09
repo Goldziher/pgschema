@@ -282,11 +282,12 @@ type SQLStatement struct {
 
 // Diff represents one or more related SQL statements with their source change
 type Diff struct {
-	Statements []SQLStatement `json:"statements"`
-	Type       DiffType       `json:"type"`
-	Operation  DiffOperation  `json:"operation"` // create, alter, drop, replace
-	Path       string         `json:"path"`
-	Source     DiffSource     `json:"-"` // interface; not JSON-serializable (see #305)
+	Statements    []SQLStatement `json:"statements"`
+	Type          DiffType       `json:"type"`
+	Operation     DiffOperation  `json:"operation"` // create, alter, drop, replace
+	Path          string         `json:"path"`
+	Source        DiffSource     `json:"-"` // interface; not JSON-serializable (see #305)
+	OwnerIdentity OwnerIdentity  `json:"-"`
 }
 
 type ddlDiff struct {

@@ -28,10 +28,10 @@ func TestReviewToSQLRendersExecutionRole(t *testing.T) {
 	require.Equal(t, "SET ROLE app_owner;\nCREATE INDEX CONCURRENTLY idx_documents ON documents (id);\nRESET ROLE;\n", sql)
 }
 
-func TestReviewRoutineExecutionIdentityDoesNotChangePublicPath(t *testing.T) {
+func TestReviewRoutineOwnerIdentityDoesNotChangePublicPath(t *testing.T) {
 	routine := &ir.Function{
-		Schema: "public",
-		Name:   "calculate",
+		Schema: "audit.log",
+		Name:   "calculate.total",
 		Parameters: []*ir.Parameter{{
 			DataType: "integer",
 			Mode:     "IN",
@@ -41,15 +41,35 @@ func TestReviewRoutineExecutionIdentityDoesNotChangePublicPath(t *testing.T) {
 		Statements: []diff.SQLStatement{{SQL: "COMMENT ON FUNCTION calculate(integer) IS 'integer';"}},
 		Type:       diff.DiffTypeFunction,
 		Operation:  diff.DiffOperationAlter,
-		Path:       "public.calculate",
+		Path:       "audit.log.calculate.total",
 		Source:     routine,
 	}}
 
 	groups := groupDiffs(diffs, 15, nil)
 	require.Len(t, groups, 1)
 	require.Len(t, groups[0].Steps, 1)
-	require.Equal(t, "public.calculate", groups[0].Steps[0].Path)
-	require.Equal(t, "public.calculate(integer)", groups[0].Steps[0].ExecutionIdentity)
+	require.Equal(t, "audit.log.calculate.total", groups[0].Steps[0].Path)
+	require.Equal(t, diff.OwnerIdentity{
+		Kind: diff.OwnerIdentityRoutine, Schema: "audit.log", Name: `"calculate.total"(integer)`, RoutineKind: "f",
+	}, groups[0].Steps[0].OwnerIdentity)
+}
+
+func TestReviewZeroArgumentAggregateUsesCatalogIdentity(t *testing.T) {
+	aggregate := &ir.Aggregate{Schema: "audit.log", Name: "row.count"}
+	diffs := []diff.Diff{{
+		Statements: []diff.SQLStatement{{SQL: `COMMENT ON AGGREGATE "row.count" (*) IS 'count';`}},
+		Type:       diff.DiffTypeAggregate,
+		Operation:  diff.DiffOperationAlter,
+		Path:       "audit.log.row.count",
+		Source:     aggregate,
+	}}
+
+	groups := groupDiffs(diffs, 15, nil)
+	require.Len(t, groups, 1)
+	require.Len(t, groups[0].Steps, 1)
+	require.Equal(t, diff.OwnerIdentity{
+		Kind: diff.OwnerIdentityRoutine, Schema: "audit.log", Name: `"row.count"()`, RoutineKind: "a",
+	}, groups[0].Steps[0].OwnerIdentity)
 }
 
 // sharedTestPostgres is the shared embedded postgres instance for all tests in this package

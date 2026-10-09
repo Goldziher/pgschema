@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/pgplex/pgschema/internal/diff"
 	"github.com/pgplex/pgschema/internal/globalstate"
 	internalplan "github.com/pgplex/pgschema/internal/plan"
 	"github.com/stretchr/testify/require"
@@ -32,6 +33,7 @@ func TestReviewSuperuserDoesNotAssumeAffectedObjectOwner(t *testing.T) {
 func TestReviewDefaultPrivilegeUsesDeclaredOwner(t *testing.T) {
 	p := &internalplan.Plan{Groups: []internalplan.ExecutionGroup{{Steps: []internalplan.Step{{
 		Type: "default_privilege", Operation: "create", Path: "default_privileges.deployer.TABLES.app_reader",
+		OwnerIdentity: diff.OwnerIdentity{Kind: diff.OwnerIdentityDefaultPrivilege, Role: "deployer"},
 	}}}}}
 	current := globalstate.Snapshot{SessionRole: globalstate.RoleState{Name: "deployer"}}
 

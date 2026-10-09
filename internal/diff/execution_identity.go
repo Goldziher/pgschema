@@ -6,42 +6,161 @@ import (
 	"github.com/pgplex/pgschema/ir"
 )
 
-func ExecutionIdentity(d Diff) string {
+type OwnerIdentityKind string
+
+const (
+	OwnerIdentityRelation         OwnerIdentityKind = "relation"
+	OwnerIdentityType             OwnerIdentityKind = "type"
+	OwnerIdentityRoutine          OwnerIdentityKind = "routine"
+	OwnerIdentityDefaultPrivilege OwnerIdentityKind = "default_privilege"
+)
+
+type OwnerIdentity struct {
+	Kind        OwnerIdentityKind
+	Schema      string
+	Name        string
+	RoutineKind string
+	Role        string
+}
+
+func ExecutionOwnerIdentity(d Diff) OwnerIdentity {
+	if d.OwnerIdentity.Kind != "" {
+		return d.OwnerIdentity
+	}
 	switch source := d.Source.(type) {
 	case *ir.Function:
-		return functionExecutionIdentity(source)
+		return functionOwnerIdentity(source)
 	case *functionDiff:
-		return functionExecutionIdentity(source.Old)
+		return functionOwnerIdentity(source.Old)
 	case *ir.Procedure:
-		return procedureExecutionIdentity(source)
+		return procedureOwnerIdentity(source)
 	case *procedureDiff:
-		return procedureExecutionIdentity(source.Old)
+		return procedureOwnerIdentity(source.Old)
 	case *ir.Aggregate:
-		return aggregateExecutionIdentity(source)
+		return aggregateOwnerIdentity(source)
 	case *aggregateDiff:
-		return aggregateExecutionIdentity(source.Old)
+		return aggregateOwnerIdentity(source.Old)
+	case *ir.Table:
+		return relationOwnerIdentity(source.Schema, source.Name)
+	case *tableDiff:
+		return relationOwnerIdentity(source.Table.Schema, source.Table.Name)
+	case *ir.View:
+		return relationOwnerIdentity(source.Schema, source.Name)
+	case *viewDiff:
+		return relationOwnerIdentity(source.Old.Schema, source.Old.Name)
+	case *ir.Sequence:
+		return relationOwnerIdentity(source.Schema, source.Name)
+	case *sequenceDiff:
+		return relationOwnerIdentity(source.Old.Schema, source.Old.Name)
+	case *ir.Constraint:
+		return relationOwnerIdentity(source.Schema, source.Table)
+	case *ConstraintDiff:
+		return relationOwnerIdentity(source.Old.Schema, source.Old.Table)
+	case *ir.Index:
+		return relationOwnerIdentity(source.Schema, source.Table)
+	case *IndexDiff:
+		return relationOwnerIdentity(source.Old.Schema, source.Old.Table)
+	case *ir.Trigger:
+		return relationOwnerIdentity(source.Schema, source.Table)
+	case *triggerDiff:
+		return relationOwnerIdentity(source.Old.Schema, source.Old.Table)
+	case *ir.RLSPolicy:
+		return relationOwnerIdentity(source.Schema, source.Table)
+	case *policyDiff:
+		return relationOwnerIdentity(source.Old.Schema, source.Old.Table)
+	case *rlsChange:
+		return relationOwnerIdentity(source.Table.Schema, source.Table.Name)
+	case *ir.Type:
+		return typeOwnerIdentity(source.Schema, source.Name)
+	case *typeDiff:
+		return typeOwnerIdentity(source.Old.Schema, source.Old.Name)
+	case *ir.DefaultPrivilege:
+		return OwnerIdentity{Kind: OwnerIdentityDefaultPrivilege, Role: source.OwnerRole}
+	case *defaultPrivilegeDiff:
+		return OwnerIdentity{Kind: OwnerIdentityDefaultPrivilege, Role: source.Old.OwnerRole}
+	case *ir.Privilege:
+		return privilegeOwnerIdentity(source)
+	case *privilegeDiff:
+		return privilegeOwnerIdentity(source.Old)
+	case *ir.RevokedDefaultPrivilege:
+		return revokedDefaultPrivilegeOwnerIdentity(source)
+	case *ir.ColumnPrivilege:
+		return relationOwnerIdentity("", source.TableName)
+	case *columnPrivilegeDiff:
+		return relationOwnerIdentity("", source.Old.TableName)
 	default:
-		return ""
+		return OwnerIdentity{}
 	}
 }
 
-func functionExecutionIdentity(function *ir.Function) string {
+func RelationOwnerIdentity(schema, name string) OwnerIdentity {
+	return relationOwnerIdentity(schema, name)
+}
+
+func relationOwnerIdentity(schema, name string) OwnerIdentity {
+	return OwnerIdentity{Kind: OwnerIdentityRelation, Schema: schema, Name: name}
+}
+
+func typeOwnerIdentity(schema, name string) OwnerIdentity {
+	return OwnerIdentity{Kind: OwnerIdentityType, Schema: schema, Name: name}
+}
+
+func functionOwnerIdentity(function *ir.Function) OwnerIdentity {
 	if function == nil {
-		return ""
+		return OwnerIdentity{}
 	}
-	return fmt.Sprintf("%s.%s(%s)", function.Schema, function.Name, function.GetArguments())
+	return routineOwnerIdentity(function.Schema, function.Name, function.GetArguments(), "f")
 }
 
-func procedureExecutionIdentity(procedure *ir.Procedure) string {
+func procedureOwnerIdentity(procedure *ir.Procedure) OwnerIdentity {
 	if procedure == nil {
-		return ""
+		return OwnerIdentity{}
 	}
-	return fmt.Sprintf("%s.%s(%s)", procedure.Schema, procedure.Name, procedure.GetArguments())
+	return routineOwnerIdentity(procedure.Schema, procedure.Name, procedure.GetArguments(), "p")
 }
 
-func aggregateExecutionIdentity(aggregate *ir.Aggregate) string {
+func aggregateOwnerIdentity(aggregate *ir.Aggregate) OwnerIdentity {
 	if aggregate == nil {
-		return ""
+		return OwnerIdentity{}
 	}
-	return fmt.Sprintf("%s.%s(%s)", aggregate.Schema, aggregate.Name, aggregateArgs(aggregate.Arguments))
+	return routineOwnerIdentity(aggregate.Schema, aggregate.Name, aggregate.Arguments, "a")
+}
+
+func routineOwnerIdentity(schema, name, arguments, kind string) OwnerIdentity {
+	identity := fmt.Sprintf("%s(%s)", ir.QuoteIdentifier(name), arguments)
+	return OwnerIdentity{Kind: OwnerIdentityRoutine, Schema: schema, Name: identity, RoutineKind: kind}
+}
+
+func privilegeOwnerIdentity(privilege *ir.Privilege) OwnerIdentity {
+	if privilege == nil {
+		return OwnerIdentity{}
+	}
+	switch privilege.ObjectType {
+	case ir.PrivilegeObjectTypeTable, ir.PrivilegeObjectTypeView, ir.PrivilegeObjectTypeSequence:
+		return relationOwnerIdentity("", privilege.ObjectName)
+	case ir.PrivilegeObjectTypeFunction:
+		return OwnerIdentity{Kind: OwnerIdentityRoutine, Name: privilege.ObjectName, RoutineKind: "f"}
+	case ir.PrivilegeObjectTypeProcedure:
+		return OwnerIdentity{Kind: OwnerIdentityRoutine, Name: privilege.ObjectName, RoutineKind: "p"}
+	case ir.PrivilegeObjectTypeType:
+		return typeOwnerIdentity("", privilege.ObjectName)
+	default:
+		return OwnerIdentity{}
+	}
+}
+
+func revokedDefaultPrivilegeOwnerIdentity(privilege *ir.RevokedDefaultPrivilege) OwnerIdentity {
+	if privilege == nil {
+		return OwnerIdentity{}
+	}
+	switch privilege.ObjectType {
+	case ir.PrivilegeObjectTypeFunction:
+		return OwnerIdentity{Kind: OwnerIdentityRoutine, Name: privilege.ObjectName, RoutineKind: "f"}
+	case ir.PrivilegeObjectTypeProcedure:
+		return OwnerIdentity{Kind: OwnerIdentityRoutine, Name: privilege.ObjectName, RoutineKind: "p"}
+	case ir.PrivilegeObjectTypeType:
+		return typeOwnerIdentity("", privilege.ObjectName)
+	default:
+		return OwnerIdentity{}
+	}
 }

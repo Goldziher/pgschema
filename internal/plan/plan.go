@@ -36,9 +36,9 @@ type Directive struct {
 
 // Step represents a single execution step with SQL and optional directive
 type Step struct {
-	SQL               string     `json:"sql"`
-	Directive         *Directive `json:"directive,omitempty"`
-	ExecutionIdentity string     `json:"-"`
+	SQL           string             `json:"sql"`
+	Directive     *Directive         `json:"directive,omitempty"`
+	OwnerIdentity diff.OwnerIdentity `json:"-"`
 	// Metadata for summary generation
 	Type      string `json:"type,omitempty"`      // e.g., "table", "index"
 	Operation string `json:"operation,omitempty"` // e.g., "create", "alter", "drop"
@@ -216,12 +216,12 @@ func groupDiffs(diffs []diff.Diff, targetMajorVersion int, currentIR *ir.IR) []E
 			// For operations with rewrites, create one step per rewrite statement
 			for _, rewriteStep := range rewriteSteps {
 				step := Step{
-					SQL:               rewriteStep.SQL,
-					Type:              d.Type.String(),
-					Operation:         d.Operation.String(),
-					Path:              d.Path,
-					Directive:         rewriteStep.Directive,
-					ExecutionIdentity: diff.ExecutionIdentity(d),
+					SQL:           rewriteStep.SQL,
+					Type:          d.Type.String(),
+					Operation:     d.Operation.String(),
+					Path:          d.Path,
+					Directive:     rewriteStep.Directive,
+					OwnerIdentity: diff.ExecutionOwnerIdentity(d),
 				}
 
 				// Check if this step needs isolation: it has a directive, cannot
@@ -249,11 +249,11 @@ func groupDiffs(diffs []diff.Diff, targetMajorVersion int, currentIR *ir.IR) []E
 			// For operations without rewrites, create one step per canonical statement
 			for _, stmt := range d.Statements {
 				step := Step{
-					SQL:               stmt.SQL,
-					Type:              d.Type.String(),
-					Operation:         d.Operation.String(),
-					Path:              d.Path,
-					ExecutionIdentity: diff.ExecutionIdentity(d),
+					SQL:           stmt.SQL,
+					Type:          d.Type.String(),
+					Operation:     d.Operation.String(),
+					Path:          d.Path,
+					OwnerIdentity: diff.ExecutionOwnerIdentity(d),
 				}
 				// Canonical statements don't have directives
 				transactionalSteps = append(transactionalSteps, step)
