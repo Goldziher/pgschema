@@ -592,26 +592,7 @@ func inspectPlanStepOwner(ctx context.Context, db *sql.DB, step plan.Step, targe
 			JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
 			WHERE n.nspname = $1 AND t.typname = $2`, schema, identity.Name)
 	case diff.OwnerIdentityRoutine:
-		if identity.CatalogRoutineIdentity {
-			return inspectSinglePlanOwner(ctx, db, `
-				SELECT pg_get_userbyid(p.proowner)
-				FROM pg_catalog.pg_proc p
-				JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-				WHERE n.nspname = $1
-				  AND p.proname || '(' ||
-				      replace(replace(pg_catalog.pg_get_function_identity_arguments(p.oid),
-				          pg_catalog.quote_ident($1) || '.', ''), $1 || '.', '') || ')' = $2
-				  AND p.prokind = $3`, schema, identity.Name, identity.RoutineKind)
-		}
-		return inspectSinglePlanOwner(ctx, db, `
-			SELECT pg_get_userbyid(p.proowner)
-			FROM pg_catalog.pg_proc p
-			JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-			WHERE n.nspname = $1
-			  AND p.proname = $2
-			  AND replace(replace(pg_catalog.oidvectortypes(p.proargtypes),
-			      pg_catalog.quote_ident($1) || '.', ''), $1 || '.', '') = $3
-			  AND p.prokind = $4`, schema, identity.Name, identity.Arguments, identity.RoutineKind)
+		return inspectRoutinePlanOwner(ctx, db, schema, identity)
 	case diff.OwnerIdentityDefaultPrivilege:
 		if identity.Role == "" {
 			return "", false, fmt.Errorf("cannot resolve default privilege owner from path %q", step.Path)
@@ -625,6 +606,50 @@ func inspectPlanStepOwner(ctx context.Context, db *sql.DB, step plan.Step, targe
 	default:
 		return "", false, fmt.Errorf("cannot safely resolve execution owner for %s %q", step.Type, step.Path)
 	}
+}
+
+func inspectRoutinePlanOwner(
+	ctx context.Context,
+	db *sql.DB,
+	schema string,
+	identity diff.OwnerIdentity,
+) (string, bool, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT pg_get_userbyid(p.proowner), p.proname,
+		       pg_catalog.pg_get_function_identity_arguments(p.oid),
+		       pg_catalog.oidvectortypes(p.proargtypes)
+		FROM pg_catalog.pg_proc p
+		JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+		WHERE n.nspname = $1 AND p.prokind = $2`, schema, identity.RoutineKind)
+	if err != nil {
+		return "", false, fmt.Errorf("inspect owner for planned routine: %w", err)
+	}
+	defer rows.Close()
+	owners := make([]string, 0, 1)
+	for rows.Next() {
+		var owner, name, catalogArguments, typeArguments string
+		if err := rows.Scan(&owner, &name, &catalogArguments, &typeArguments); err != nil {
+			return "", false, fmt.Errorf("scan owner for planned routine: %w", err)
+		}
+		matches := name == identity.Name && ir.StripSchemaQualifiers(typeArguments, schema) == identity.Arguments
+		if identity.CatalogRoutineIdentity {
+			candidate := name + "(" + ir.StripSchemaQualifiers(catalogArguments, schema) + ")"
+			matches = candidate == identity.Name
+		}
+		if matches {
+			owners = append(owners, owner)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", false, fmt.Errorf("inspect owner for planned routine: %w", err)
+	}
+	if len(owners) > 1 {
+		return "", false, fmt.Errorf("planned routine %q resolves to multiple owners", identity.Name)
+	}
+	if len(owners) == 0 {
+		return "", false, nil
+	}
+	return owners[0], true, nil
 }
 
 func inspectRelationOwner(ctx context.Context, db *sql.DB, schema, name string) (string, bool, error) {

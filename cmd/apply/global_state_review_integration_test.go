@@ -145,7 +145,10 @@ CREATE ROLE app_owner;
 CREATE ROLE "app.reader";
 CREATE ROLE "column.reader";
 CREATE SCHEMA managed AUTHORIZATION app_owner;
+CREATE SCHEMA "managed.foo";
+CREATE TYPE "managed.foo".custom_type AS ENUM ('one');
 GRANT USAGE, CREATE ON SCHEMA managed TO deployer;
+GRANT USAGE ON SCHEMA "managed.foo" TO deployer;
 CREATE TABLE managed.documents (id bigint PRIMARY KEY);
 ALTER TABLE managed.documents OWNER TO deployer;
 CREATE TABLE managed."audit.log" (id bigint PRIMARY KEY);
@@ -154,30 +157,28 @@ CREATE FUNCTION managed."calculate.dot"(value integer) RETURNS integer LANGUAGE 
 ALTER FUNCTION managed."calculate.dot"(integer) OWNER TO deployer;
 CREATE FUNCTION managed."calculate.dot"(value text) RETURNS text LANGUAGE sql AS 'SELECT value';
 ALTER FUNCTION managed."calculate.dot"(text) OWNER TO app_owner;
-CREATE TYPE managed.custom_type AS ENUM ('one');
-ALTER TYPE managed.custom_type OWNER TO deployer;
-CREATE FUNCTION managed."custom.arg"(value managed.custom_type) RETURNS integer LANGUAGE sql AS 'SELECT 1';
-ALTER FUNCTION managed."custom.arg"(managed.custom_type) OWNER TO deployer;
-CREATE PROCEDURE managed."custom.proc"(value managed.custom_type) LANGUAGE sql AS 'SELECT 1';
-ALTER PROCEDURE managed."custom.proc"(managed.custom_type) OWNER TO deployer;
-CREATE FUNCTION managed."custom.transition"(state bigint, value managed.custom_type) RETURNS bigint LANGUAGE sql AS 'SELECT state + 1';
-ALTER FUNCTION managed."custom.transition"(bigint, managed.custom_type) OWNER TO deployer;
-CREATE AGGREGATE managed."custom.aggregate" (managed.custom_type) (
+CREATE FUNCTION managed."custom.arg"(value "managed.foo".custom_type) RETURNS integer LANGUAGE sql AS 'SELECT 1';
+ALTER FUNCTION managed."custom.arg"("managed.foo".custom_type) OWNER TO deployer;
+CREATE PROCEDURE managed."custom.proc"(value "managed.foo".custom_type) LANGUAGE sql AS 'SELECT 1';
+ALTER PROCEDURE managed."custom.proc"("managed.foo".custom_type) OWNER TO deployer;
+CREATE FUNCTION managed."custom.transition"(state bigint, value "managed.foo".custom_type) RETURNS bigint LANGUAGE sql AS 'SELECT state + 1';
+ALTER FUNCTION managed."custom.transition"(bigint, "managed.foo".custom_type) OWNER TO deployer;
+CREATE AGGREGATE managed."custom.aggregate" ("managed.foo".custom_type) (
   SFUNC = managed."custom.transition", STYPE = bigint, INITCOND = '0'
 );
-ALTER AGGREGATE managed."custom.aggregate" (managed.custom_type) OWNER TO deployer;
-CREATE FUNCTION managed."ordered.transition"(state bigint, value managed.custom_type) RETURNS bigint LANGUAGE sql AS 'SELECT state + 1';
-ALTER FUNCTION managed."ordered.transition"(bigint, managed.custom_type) OWNER TO deployer;
-CREATE AGGREGATE managed."ordered.dot" (ORDER BY managed.custom_type) (
+ALTER AGGREGATE managed."custom.aggregate" ("managed.foo".custom_type) OWNER TO deployer;
+CREATE FUNCTION managed."ordered.transition"(state bigint, value "managed.foo".custom_type) RETURNS bigint LANGUAGE sql AS 'SELECT state + 1';
+ALTER FUNCTION managed."ordered.transition"(bigint, "managed.foo".custom_type) OWNER TO deployer;
+CREATE AGGREGATE managed."ordered.dot" (ORDER BY "managed.foo".custom_type) (
   SFUNC = managed."ordered.transition", STYPE = bigint, INITCOND = '0'
 );
-ALTER AGGREGATE managed."ordered.dot" (ORDER BY managed.custom_type) OWNER TO deployer;
-CREATE FUNCTION managed."hypothetical.transition"(state bigint, value managed.custom_type) RETURNS bigint LANGUAGE sql AS 'SELECT state + 1';
-ALTER FUNCTION managed."hypothetical.transition"(bigint, managed.custom_type) OWNER TO deployer;
-CREATE AGGREGATE managed."hypothetical.dot" (managed.custom_type ORDER BY managed.custom_type) (
+ALTER AGGREGATE managed."ordered.dot" (ORDER BY "managed.foo".custom_type) OWNER TO deployer;
+CREATE FUNCTION managed."hypothetical.transition"(state bigint, value "managed.foo".custom_type) RETURNS bigint LANGUAGE sql AS 'SELECT state + 1';
+ALTER FUNCTION managed."hypothetical.transition"(bigint, "managed.foo".custom_type) OWNER TO deployer;
+CREATE AGGREGATE managed."hypothetical.dot" ("managed.foo".custom_type ORDER BY "managed.foo".custom_type) (
   SFUNC = managed."hypothetical.transition", STYPE = bigint, INITCOND = '0', HYPOTHETICAL
 );
-ALTER AGGREGATE managed."hypothetical.dot" (managed.custom_type ORDER BY managed.custom_type) OWNER TO deployer;
+ALTER AGGREGATE managed."hypothetical.dot" ("managed.foo".custom_type ORDER BY "managed.foo".custom_type) OWNER TO deployer;
 CREATE AGGREGATE managed."row.count" (*) (SFUNC = int8inc, STYPE = bigint, INITCOND = '0');
 ALTER AGGREGATE managed."row.count" (*) OWNER TO deployer;
 `)
@@ -193,35 +194,36 @@ ALTER AGGREGATE managed."row.count" (*) OWNER TO deployer;
 	dir := t.TempDir()
 	schemaFile := filepath.Join(dir, "schema.sql")
 	require.NoError(t, os.WriteFile(schemaFile, []byte(`
+CREATE SCHEMA "managed.foo";
+CREATE TYPE "managed.foo".custom_type AS ENUM ('one');
 CREATE TABLE documents (id bigint PRIMARY KEY, title text);
 CREATE TABLE "audit.log" (id bigint PRIMARY KEY, title text);
 CREATE FUNCTION "calculate.dot"(value integer) RETURNS integer LANGUAGE sql AS 'SELECT value + 1';
 CREATE FUNCTION "calculate.dot"(value text) RETURNS text LANGUAGE sql AS 'SELECT value';
-CREATE TYPE custom_type AS ENUM ('one');
-CREATE FUNCTION "custom.arg"(value custom_type) RETURNS integer LANGUAGE sql AS 'SELECT 2';
-CREATE PROCEDURE "custom.proc"(value custom_type) LANGUAGE sql AS 'SELECT 1';
-COMMENT ON PROCEDURE "custom.proc"(custom_type) IS 'managed procedure';
-CREATE FUNCTION "custom.transition"(state bigint, value custom_type) RETURNS bigint LANGUAGE sql AS 'SELECT state + 1';
-CREATE AGGREGATE "custom.aggregate" (custom_type) (
+CREATE FUNCTION "custom.arg"(value "managed.foo".custom_type) RETURNS integer LANGUAGE sql AS 'SELECT 2';
+CREATE PROCEDURE "custom.proc"(value "managed.foo".custom_type) LANGUAGE sql AS 'SELECT 1';
+COMMENT ON PROCEDURE "custom.proc"("managed.foo".custom_type) IS 'managed procedure';
+CREATE FUNCTION "custom.transition"(state bigint, value "managed.foo".custom_type) RETURNS bigint LANGUAGE sql AS 'SELECT state + 1';
+CREATE AGGREGATE "custom.aggregate" ("managed.foo".custom_type) (
   SFUNC = "custom.transition", STYPE = bigint, INITCOND = '0'
 );
-COMMENT ON AGGREGATE "custom.aggregate" (custom_type) IS 'managed aggregate';
-CREATE FUNCTION "ordered.transition"(state bigint, value custom_type) RETURNS bigint LANGUAGE sql AS 'SELECT state + 1';
-CREATE AGGREGATE "ordered.dot" (ORDER BY custom_type) (
+COMMENT ON AGGREGATE "custom.aggregate" ("managed.foo".custom_type) IS 'managed aggregate';
+CREATE FUNCTION "ordered.transition"(state bigint, value "managed.foo".custom_type) RETURNS bigint LANGUAGE sql AS 'SELECT state + 1';
+CREATE AGGREGATE "ordered.dot" (ORDER BY "managed.foo".custom_type) (
   SFUNC = "ordered.transition", STYPE = bigint, INITCOND = '0'
 );
-COMMENT ON AGGREGATE "ordered.dot" (ORDER BY custom_type) IS 'managed ordered aggregate';
-CREATE FUNCTION "hypothetical.transition"(state bigint, value custom_type) RETURNS bigint LANGUAGE sql AS 'SELECT state + 1';
-CREATE AGGREGATE "hypothetical.dot" (custom_type ORDER BY custom_type) (
+COMMENT ON AGGREGATE "ordered.dot" (ORDER BY "managed.foo".custom_type) IS 'managed ordered aggregate';
+CREATE FUNCTION "hypothetical.transition"(state bigint, value "managed.foo".custom_type) RETURNS bigint LANGUAGE sql AS 'SELECT state + 1';
+CREATE AGGREGATE "hypothetical.dot" ("managed.foo".custom_type ORDER BY "managed.foo".custom_type) (
   SFUNC = "hypothetical.transition", STYPE = bigint, INITCOND = '0', HYPOTHETICAL
 );
-COMMENT ON AGGREGATE "hypothetical.dot" (custom_type ORDER BY custom_type) IS 'managed hypothetical aggregate';
+COMMENT ON AGGREGATE "hypothetical.dot" ("managed.foo".custom_type ORDER BY "managed.foo".custom_type) IS 'managed hypothetical aggregate';
 CREATE AGGREGATE "row.count" (*) (SFUNC = int8inc, STYPE = bigint, INITCOND = '0');
 COMMENT ON AGGREGATE "row.count" (*) IS 'managed count';
 GRANT SELECT ON TABLE "audit.log" TO "app.reader";
 GRANT UPDATE (title) ON TABLE "audit.log" TO "column.reader";
-GRANT EXECUTE ON FUNCTION "custom.arg"(custom_type) TO "app.reader";
-REVOKE EXECUTE ON FUNCTION "custom.arg"(custom_type) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION "custom.arg"("managed.foo".custom_type) TO "app.reader";
+REVOKE EXECUTE ON FUNCTION "custom.arg"("managed.foo".custom_type) FROM PUBLIC;
 ALTER DEFAULT PRIVILEGES FOR ROLE deployer IN SCHEMA managed GRANT SELECT ON TABLES TO "app.reader";
 `), 0o600))
 	globalFile := filepath.Join(dir, "global.toml")
@@ -278,19 +280,19 @@ SELECT EXISTS (
 	var calculated int
 	require.NoError(t, admin.QueryRowContext(ctx, `SELECT managed."calculate.dot"(1)`).Scan(&calculated))
 	require.Equal(t, 2, calculated)
-	require.NoError(t, admin.QueryRowContext(ctx, `SELECT managed."custom.arg"('one'::managed.custom_type)`).Scan(&calculated))
+	require.NoError(t, admin.QueryRowContext(ctx, `SELECT managed."custom.arg"('one'::"managed.foo".custom_type)`).Scan(&calculated))
 	require.Equal(t, 2, calculated)
 	var canExecuteCustom bool
-	require.NoError(t, admin.QueryRowContext(ctx, `SELECT has_function_privilege('app.reader', 'managed."custom.arg"(managed.custom_type)', 'EXECUTE')`).Scan(&canExecuteCustom))
+	require.NoError(t, admin.QueryRowContext(ctx, `SELECT has_function_privilege('app.reader', 'managed."custom.arg"("managed.foo".custom_type)', 'EXECUTE')`).Scan(&canExecuteCustom))
 	require.True(t, canExecuteCustom)
 	var publicCanExecuteCustom bool
-	require.NoError(t, admin.QueryRowContext(ctx, `SELECT has_function_privilege('public', 'managed."custom.arg"(managed.custom_type)', 'EXECUTE')`).Scan(&publicCanExecuteCustom))
+	require.NoError(t, admin.QueryRowContext(ctx, `SELECT has_function_privilege('public', 'managed."custom.arg"("managed.foo".custom_type)', 'EXECUTE')`).Scan(&publicCanExecuteCustom))
 	require.False(t, publicCanExecuteCustom)
 	var procedureComment string
-	require.NoError(t, admin.QueryRowContext(ctx, `SELECT obj_description('managed."custom.proc"(managed.custom_type)'::regprocedure, 'pg_proc')`).Scan(&procedureComment))
+	require.NoError(t, admin.QueryRowContext(ctx, `SELECT obj_description('managed."custom.proc"("managed.foo".custom_type)'::regprocedure, 'pg_proc')`).Scan(&procedureComment))
 	require.Equal(t, "managed procedure", procedureComment)
 	var customAggregateComment string
-	require.NoError(t, admin.QueryRowContext(ctx, `SELECT obj_description('managed."custom.aggregate"(managed.custom_type)'::regprocedure, 'pg_proc')`).Scan(&customAggregateComment))
+	require.NoError(t, admin.QueryRowContext(ctx, `SELECT obj_description('managed."custom.aggregate"("managed.foo".custom_type)'::regprocedure, 'pg_proc')`).Scan(&customAggregateComment))
 	require.Equal(t, "managed aggregate", customAggregateComment)
 	var orderedAggregateComment string
 	require.NoError(t, admin.QueryRowContext(ctx, `
